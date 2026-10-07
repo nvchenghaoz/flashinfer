@@ -201,7 +201,13 @@ def test_batch_prefill_with_ragged_kv_cache_fp8(
     )
     o_fp8 = wrapper_f8.run(q, k_fp8, v_fp8)
 
-    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
+    if wrapper_f8._plan_info[_PLAN_INFO_FP8_MMA_IDX]:
+        # SM12x runs long FP8-KV prefills with FP8 math (Q and P rounded to e4m3), so the output differs
+        # from the 16-bit path by FP8 rounding (prefill_fp8_mma_sm12x.cuh).
+        rel = (o_fp8.float() - o_ref.float()).norm() / o_ref.float().norm()
+        assert rel < 6e-2, rel
+    else:
+        torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -292,6 +298,7 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
 # ---------------------------------------------------------------------------
 
 _PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
+_PLAN_INFO_FP8_MMA_IDX = 15  # PrefillPlanInfo::fp8_mma
 
 
 # 128: full Q tiles; 53: partial tail tile of 21 rows (the second Q-warp of

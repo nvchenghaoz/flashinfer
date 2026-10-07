@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/attention/mask.cuh>
+#include <flashinfer/attention/prefill_fp8_mma_sm12x.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
 
@@ -44,6 +45,31 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+namespace {
+
+// Whether this module may run FP8-KV prefill with FP8 math on SM12x (prefill_fp8_mma_sm12x.cuh).
+// The plan sizes a sliding-window KV range as window_left + one CTA tile, which assumes a causal
+// window; non-causal windows keep the FA2 path and its existing semantics.
+bool FP8MMAEligible(int64_t page_size, bool causal, int64_t window_left) {
+  bool supported = false;
+  const MaskMode mask_mode = MaskMode::kNone;
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
+      RaggedParams, PagedParams, [&] {
+        supported =
+            fp8_mma_sm12x::kSupportsVariant<DTypeQ, DTypeKV, DTypeO, HEAD_DIM_QK, HEAD_DIM_VO,
+                                            POS_ENCODING_MODE, USE_SLIDING_WINDOW,
+                                            USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, MASK_MODE,
+                                            AttentionVariant>;
+        return true;
+      });
+  return supported && (window_left < 0 || causal) &&
+         fp8_mma_sm12x::RuntimeSupported(static_cast<uint32_t>(page_size));
+}
+
+}  // namespace
+
 Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
     TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
@@ -67,7 +93,8 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
       /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-      uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV),
+      /*fp8_mma_eligible=*/FP8MMAEligible(page_size, causal, window_left));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);
@@ -82,7 +109,6 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
     bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
     int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
   (void)kv_len_arr;
-  (void)causal;
   size_t float_workspace_size_in_bytes = 0;
   size_t int_workspace_size_in_bytes = 0;
 
@@ -93,7 +119,8 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
       static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       enable_cuda_graph, /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv,
-      num_colocated_ctas, uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      num_colocated_ctas, uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV),
+      /*fp8_mma_eligible=*/FP8MMAEligible(page_size, causal, window_left));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to calculate prefill workspace size with error: " << cudaGetErrorString(status);
@@ -221,12 +248,26 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
 
         cudaError_t status = cudaSuccess;
 
-        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-          status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
-              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              RaggedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
-        });
+        bool ran_fp8_mma = false;
+        if constexpr (fp8_mma_sm12x::kSupportsVariant<
+                          DTypeQ, DTypeKV, DTypeO, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                          USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, MASK_MODE,
+                          AttentionVariant>) {
+          if (plan_info.fp8_mma) {
+            status = flashinfer::BatchPrefillWithRaggedKVCacheFP8MMADispatched<
+                HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, RaggedParams>(
+                params, tmp_v, tmp_s, kv_layout == QKVLayout::kNHD ? k.size(0) : k.size(1),
+                enable_pdl, stream);
+            ran_fp8_mma = true;
+          }
+        }
+        if (!ran_fp8_mma)
+          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+            status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
+                CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
+                RaggedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+          });
 
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "BatchPrefillWithRaggedKVCache failed with error " << cudaGetErrorString(status);

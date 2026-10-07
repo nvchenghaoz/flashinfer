@@ -541,6 +541,69 @@ inline cudaError_t DecodePlanWorkspaceSize(size_t& float_workspace_size_in_bytes
       enable_cuda_graph, stream, work_estimation_func);
 }
 
+/*!
+ * \brief KV chunk size (in pages) for the FP8-MMA prefill kernel. Splitting the KV range pays only
+ * when the batch fills less than two waves, where the last wave is mostly idle; every split adds
+ * partial outputs to write and merge. Below two waves it picks the number of chunks with the lowest
+ *   estimated time, waves x chunk length x (1 + 5% per extra chunk), trying up to as many chunks as
+ *   fill one wave.
+ * \param wave_ctas CTAs of the kernel that run concurrently on the device.
+ * \param num_kv_heads CTAs per (request, query tile, KV chunk).
+ * \return (split_kv, kv_chunk_size in pages)
+ */
+inline std::tuple<bool, int64_t> PrefillWaveAwareKVChunkSize(
+    int64_t wave_ctas, int64_t num_kv_heads, const std::vector<int64_t>& packed_qo_len_arr,
+    const std::vector<int64_t>& kv_len_arr, uint32_t cta_tile_q, uint32_t min_kv_chunk_size) {
+  const int64_t wave = std::max<int64_t>(1, wave_ctas);
+  int64_t max_kv_len = 1, q_tiles = 0;
+  for (size_t i = 0; i < kv_len_arr.size(); ++i) {
+    max_kv_len = std::max(max_kv_len, kv_len_arr[i]);
+    q_tiles += ceil_div(packed_qo_len_arr[i], int64_t(cta_tile_q));
+  }
+  auto num_ctas = [&](int64_t chunk) {
+    int64_t items = 0;
+    for (size_t i = 0; i < packed_qo_len_arr.size(); ++i) {
+      items += ceil_div(packed_qo_len_arr[i], int64_t(cta_tile_q)) *
+               ceil_div(std::max<int64_t>(kv_len_arr[i], 1), chunk);
+    }
+    return items * num_kv_heads;
+  };
+  if (num_ctas(max_kv_len) >= 2 * wave) return std::make_tuple(false, max_kv_len);
+  const int64_t max_chunks = std::min<int64_t>(
+      128, std::max<int64_t>(8, ceil_div(wave, std::max<int64_t>(1, q_tiles * num_kv_heads)) + 1));
+  double best_cost = 0.0;
+  int64_t best_chunk = max_kv_len, prev_chunk = 0;
+  for (int64_t num_chunks = 1; num_chunks <= max_chunks; ++num_chunks) {
+    const int64_t chunk = std::max<int64_t>(ceil_div(max_kv_len, num_chunks), min_kv_chunk_size);
+    if (chunk == prev_chunk) continue;  // same split as fewer chunks
+    prev_chunk = chunk;
+    const double cost = double(ceil_div(num_ctas(chunk), wave)) * double(chunk) *
+                        (1.0 + 0.05 * double(ceil_div(max_kv_len, chunk) - 1));
+    if (num_chunks == 1 || cost < best_cost) {
+      best_cost = cost;
+      best_chunk = chunk;
+    }
+    if (chunk == int64_t(min_kv_chunk_size)) break;
+  }
+  return std::make_tuple(best_chunk < max_kv_len, best_chunk);
+}
+
+/*!
+ * \brief Whether a prefill plan should use the SM12x FP8-MMA kernel (prefill_fp8_mma_sm12x.cuh).
+ * \param eligible Module and device support it (FP8 KV, head dim, variant, SM12x, page size).
+ * \param packed_qo_len The packed query length FA2 sizes its CTA tile with, so the decision is as
+ *   stable under CUDA graph replay as FA2's tile choice.
+ * \param cta_tile_q Set to the FP8-MMA kernel's tile (128) when it is used.
+ */
+inline bool UseFP8MMAPrefill(bool eligible, int64_t packed_qo_len, uint32_t& cta_tile_q) {
+  // Below two CTA tiles of packed rows per request the 128-row CTA is mostly empty and FA2's
+  // smaller tiles are faster (e.g. decode through the prefill kernel).
+  constexpr int64_t kFP8MMACtaTileQ = 128;
+  if (!eligible || packed_qo_len < 2 * kFP8MMACtaTileQ) return false;
+  cta_tile_q = kFP8MMACtaTileQ;
+  return true;
+}
+
 template <typename IdType>
 inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t total_num_rows, uint32_t batch_size,
@@ -549,7 +612,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    bool enable_cuda_graph, int32_t window_left,
                                    int32_t fixed_split_size, bool disable_split_kv,
                                    int64_t uniform_q_len, uint32_t head_dim_qk = 0,
-                                   uint32_t kv_dtype_bytes = 2) {
+                                   uint32_t kv_dtype_bytes = 2, bool fp8_mma_eligible = false) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -578,6 +641,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   // step 2: determine cta_tile_q, kv_chunk_size and total_num_tiles_q
   const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
   uint32_t cta_tile_q;
+  bool use_fp8_mma = false;
   uint32_t total_num_tiles_q;
   if (enable_cuda_graph) {
     if (uniform_q_len > 0) {
@@ -595,6 +659,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
         }
       }
       cta_tile_q = FA2DetermineCtaTileQ(packed_uniform_len, head_dim, head_dim_qk, kv_dtype_bytes);
+      use_fp8_mma = UseFP8MMAPrefill(fp8_mma_eligible, packed_uniform_len, cta_tile_q);
       total_num_tiles_q = batch_size * ceil_div(packed_uniform_len, cta_tile_q);
     } else {
       // When CUDA graphs are enabled, the lengths of sequences determined by
@@ -603,6 +668,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       const uint64_t max_seq_len = total_num_rows - batch_size + 1;
       uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
       cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);
+      use_fp8_mma = UseFP8MMAPrefill(fp8_mma_eligible, max_qo_len, cta_tile_q);
 
       // Find an upper bound for the number of tiles, derived from the total
       // number of rows and the batch size.  The sum of qo lengths rounded
@@ -617,6 +683,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
     cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);
+    use_fp8_mma = UseFP8MMAPrefill(fp8_mma_eligible, avg_packed_qo_len, cta_tile_q);
 
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
@@ -632,12 +699,26 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
         std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
                  kv_len_arr[i]);
   }
+  if (use_fp8_mma && head_dim >= 128) {
+    // The FP8-MMA kernel runs one CTA per SM at head_dim >= 128 (two at 64, like FA2).
+    max_batch_size_if_split = std::max(1U, max_batch_size_if_split / 2);
+  }
   bool split_kv = false;
   int64_t kv_chunk_size;
   if (disable_split_kv) {
     kv_chunk_size = std::numeric_limits<int64_t>::max();
   } else if (!disable_split_kv && fixed_split_size > 0) {
     kv_chunk_size = fixed_split_size;
+  } else if (use_fp8_mma && !enable_cuda_graph) {
+    // The FP8-MMA kernel runs one CTA per SM at head_dim >= 128 and two at 64.
+    int dev_id = 0, num_sm = 0;
+    if (cudaGetDevice(&dev_id) != cudaSuccess ||
+        cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id) != cudaSuccess) {
+      FLASHINFER_ERROR("Failed to query the number of SMs");
+    }
+    std::tie(split_kv, kv_chunk_size) = PrefillWaveAwareKVChunkSize(
+        int64_t(num_sm) * (head_dim >= 128 ? 1 : 2), num_kv_heads, packed_qo_len_arr,
+        effective_kv_len_arr, cta_tile_q, min_kv_chunk_size);
   } else {
     std::tie(split_kv, kv_chunk_size) = PrefillBinarySearchKVChunkSize(
         enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
@@ -679,7 +760,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   kv_chunk_size *= page_size;
   return std::make_tuple(split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
                          std::move(request_indices), std::move(qo_tile_indices),
-                         std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr));
+                         std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr),
+                         use_fp8_mma);
 }
 
 struct PrefillPlanInfo {
@@ -698,6 +780,7 @@ struct PrefillPlanInfo {
   int64_t block_valid_mask_offset;
   bool enable_cuda_graph;
   bool split_kv;
+  bool fp8_mma;  // run the SM12x FP8-MMA kernel (prefill_fp8_mma_sm12x.cuh)
 
   PrefillPlanInfo()
       : padded_batch_size(0),
@@ -714,7 +797,8 @@ struct PrefillPlanInfo {
         s_offset(0),
         block_valid_mask_offset(0),
         enable_cuda_graph(false),
-        split_kv(false) {}
+        split_kv(false),
+        fp8_mma(false) {}
 
   // convert PrefillPlanInfo to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
@@ -732,14 +816,15 @@ struct PrefillPlanInfo {
             s_offset,
             block_valid_mask_offset,
             enable_cuda_graph,
-            split_kv};
+            split_kv,
+            fp8_mma};
   }
 
   // From std::vector<int64_t> to PrefillPlanInfo
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 15) {
+    if (vec.size() != 16) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 15, but got " << vec.size();
+      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 16, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size = vec[0];
@@ -757,6 +842,7 @@ struct PrefillPlanInfo {
     block_valid_mask_offset = vec[12];
     enable_cuda_graph = vec[13];
     split_kv = vec[14];
+    fp8_mma = vec[15];
   }
 };
 
@@ -771,7 +857,8 @@ inline cudaError_t PrefillPlanImpl(
     bool disable_split_kv,
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
-    int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
+    int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2,
+    bool fp8_mma_eligible = false) {
   (void)sizeof_dtype_o;
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -792,13 +879,14 @@ inline cudaError_t PrefillPlanImpl(
 
   // step 2: determine kv_chunk_size
   auto [split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size, request_indices_vec,
-        qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
+        qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec, use_fp8_mma] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
                              enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
-                             uniform_q_len, head_dim_qk, kv_dtype_bytes);
+                             uniform_q_len, head_dim_qk, kv_dtype_bytes, fp8_mma_eligible);
 
   plan_info.cta_tile_q = cta_tile_q;
+  plan_info.fp8_mma = use_fp8_mma;
   plan_info.total_num_rows = total_num_rows;
   plan_info.enable_cuda_graph = enable_cuda_graph;
   plan_info.padded_batch_size = padded_batch_size;
@@ -939,7 +1027,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
                                int64_t uniform_q_len, cudaStream_t stream,
-                               uint32_t kv_dtype_bytes = 2) {
+                               uint32_t kv_dtype_bytes = 2, bool fp8_mma_eligible = false) {
   size_t used_float_workspace_size = 0;
   size_t used_int_workspace_size = 0;
   return PrefillPlanImpl<true>(used_float_workspace_size, used_int_workspace_size, float_buffer,
@@ -948,7 +1036,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
                                head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
                                window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-                               uniform_q_len, stream, kv_dtype_bytes);
+                               uniform_q_len, stream, kv_dtype_bytes, fp8_mma_eligible);
 }
 
 template <typename IdType>
@@ -958,16 +1046,16 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
     bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len, cudaStream_t stream,
-    uint32_t kv_dtype_bytes = 2) {
+    uint32_t kv_dtype_bytes = 2, bool fp8_mma_eligible = false) {
   PrefillPlanInfo plan_info;
-  return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
-                                /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
-                                /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
-                                /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h,
-                                kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
-                                head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-                                sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
-                                num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes);
+  return PrefillPlanImpl<false>(
+      float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+      /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
+      /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
+      /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows,
+      batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
+      enable_cuda_graph, sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
+      num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes, fp8_mma_eligible);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }

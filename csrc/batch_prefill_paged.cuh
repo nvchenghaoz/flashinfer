@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <flashinfer/attention/prefill_fp8_mma_sm12x.cuh>
+
 void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
                                      TensorView q, TensorView paged_k_cache,
@@ -139,6 +141,21 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         }
 
         cudaError_t status = cudaSuccess;
+
+        // FP8-math path (any K/V strides: it builds separate K and V tensor maps).
+        if constexpr (fp8_mma_sm12x::kSupportsVariant<
+                          DTypeQ, DTypeKV, DTypeO, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                          USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, MASK_MODE,
+                          AttentionVariant>) {
+          if (plan_info.fp8_mma) {
+            status = flashinfer::BatchPrefillWithPagedKVCacheFP8MMADispatched<
+                HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, PagedParams>(
+                params, tmp_v, tmp_s, paged_k_cache.size(0), enable_pdl, stream);
+            TVM_FFI_ICHECK(status == cudaSuccess)
+                << "BatchPrefillWithPagedKVCache failed with error " << cudaGetErrorString(status);
+            return true;
+          }
+        }
 
 #if PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_RUNTIME
         DISPATCH_BOOL(kv_strides_are_identical, SAME_KV_STRIDES, [&] {
