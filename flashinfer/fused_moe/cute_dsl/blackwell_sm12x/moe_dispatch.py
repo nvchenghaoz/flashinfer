@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple, Union
 
 import cutlass
@@ -25,6 +25,7 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from flashinfer.utils import get_compute_capability
 from .moe_activation import SWIGLUOAI_UNINTERLEAVE, is_gated_activation
 from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
@@ -77,23 +78,14 @@ _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
 # The micro kernel's per-token staging assumes decode-sized batches.
 _MICRO_MAX_TOKENS = 8
-# Direct micro takes the smallest decode batches ahead of the MMA micro
-# kernel, and only at small intermediate sizes where its CUDA-core dots
-# keep up with per-token work. Measured on GB10, pending other GPUs.
-_DIRECT_MICRO_CUTOVER_PAIRS = 32
+# Direct micro only runs at small intermediate sizes, where its CUDA-core dots
+# keep up with per-token work.
 _DIRECT_MICRO_MAX_N = 512
+
+
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
 # "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
 _FORCED_BACKEND: str | None = None
-# Production static band: pairs <= 640 (M <= 80 at topk=8). The kernel's
-# 32-row virtual-expert split keeps every scheduled tile inside the tile64
-# kernel's single computed M step, making the full compact band correct at
-# any per-expert row count.
-_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
-# The retained NVFP4 path uses the tile64 schedule through 1024 routed pairs.
-# MXFP4 keeps the generic 640-pair compact boundary.
-_STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT = 1024
-_STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 
 # MAC (max active clusters) tuning ladders from b12x decode profiling.
@@ -117,13 +109,90 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (768, 92),
     (1024, 110),
 )
-# Workloads at or below the static cutover (640 pairs MXFP4, 1024 NVFP4)
-# take the static kernel, so for NVFP4 these entries are reachable only
-# when the dynamic backend is forced; MXFP4 still reaches the 1024 entry.
+# Workloads at or below the static cutover (640 pairs MXFP4, 1024 NVFP4 in
+# _BASE_TUNING / _NVFP4_TUNING) take the static kernel, so for NVFP4 these
+# entries are reachable only when the dynamic backend is forced; MXFP4 still
+# reaches the 1024 entry.
 _DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (640, 188),
     (1024, 147),
 )
+
+
+@dataclass(frozen=True)
+class _LaunchTuning:
+    """Size cutovers and launch shapes measured on one SM12x GPU."""
+
+    # Direct micro takes routed (token, expert) pairs below this count, ahead
+    # of the MMA micro and static kernels.
+    direct_micro_cutover_pairs: int
+    # Static kernel M tile; None keeps _select_moe_mma_tiler_mn's choice.
+    static_tile_m: int | None
+    # Direct micro sizes FC1 work to finish in one round over its grid (see
+    # MoEDirectMicroKernel.configure).
+    direct_micro_one_round_fc1: bool
+    # Routed pairs up to which the static kernel runs; the dynamic kernel takes
+    # larger batches. A static workspace holds this many rows per expert, so the
+    # cutover also sets each B12xMoEWrapper's static workspace size.
+    static_cutover_pairs: int
+    # Static kernel persistent-grid size per routed-row count (see
+    # _lookup_mac_ladder); empty keeps every resident SM.
+    static_mac_ladder: Tuple[Tuple[int, int], ...]
+
+
+# Defaults for every GPU without its own entry. The direct micro cutover was
+# measured on GB10 (SM121, 48 SMs). Static band: pairs <= 640 (M <= 80 at
+# topk=8). The kernel's 32-row virtual-expert split keeps every scheduled tile
+# inside the tile64 kernel's single computed M step, making the full compact
+# band correct at any per-expert row count.
+_BASE_TUNING = _LaunchTuning(
+    direct_micro_cutover_pairs=32,
+    static_tile_m=None,
+    direct_micro_one_round_fc1=False,
+    static_cutover_pairs=640,
+    static_mac_ladder=_STATIC_MAC_LADDER,
+)
+# The retained NVFP4 path uses the tile64 schedule through 1024 routed pairs.
+# MXFP4 keeps the generic 640-pair compact boundary.
+_NVFP4_TUNING = replace(_BASE_TUNING, static_cutover_pairs=1024)
+# Measured on RTX PRO 6000 (SM120, 188 SMs) with 256 experts, top-8, hidden
+# 2048, intermediate 512, in the model's order (router GEMM, then the experts,
+# with a W4A4 shared expert on a second stream):
+# - direct micro up to 8 tokens;
+# - M64 static tiles, which skip half the per-tile activation, quantize, FC2
+#   and scatter work on rows that carry no tokens when experts see a handful
+#   of rows each;
+# - static kernel up to 256 tokens: with M64 tiles it stays ahead of the
+#   dynamic kernel up to ~320 tokens, but past 256 the gain is under 1% while
+#   the static workspace (~0.6 GiB per wrapper at 2048 rows) keeps growing;
+# - every resident SM in the static grid: its task count depends on how many
+#   distinct experts the routing touches.
+_SM120_NVFP4_TUNING = _LaunchTuning(
+    direct_micro_cutover_pairs=65,
+    static_tile_m=64,
+    direct_micro_one_round_fc1=True,
+    static_cutover_pairs=2048,
+    static_mac_ladder=(),
+)
+
+
+def _launch_tuning(
+    device: torch.device, quant_mode: str | None = "nvfp4"
+) -> _LaunchTuning:
+    """The launch tuning measured for this GPU and format.
+
+    Only NVFP4 on SM120 has its own values; other GPUs, and hosts without a
+    CUDA device, keep the defaults.
+    """
+    if quant_mode != "nvfp4":
+        return _BASE_TUNING
+    if (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and get_compute_capability(_canonical_cuda_device(device)) == (12, 0)
+    ):
+        return _SM120_NVFP4_TUNING
+    return _NVFP4_TUNING
 
 
 def _lookup_mac_ladder(
@@ -298,11 +367,7 @@ def _get_static_compact_cutover_pairs(
         # Only the retained NVFP4 implementation earns the wider band; the
         # generic implementation (MXFP4, or unspecified quant mode) keeps
         # the original boundary.
-        cached = (
-            _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT
-            if quant_mode == "nvfp4"
-            else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-        )
+        cached = _launch_tuning(torch.device("cuda"), quant_mode).static_cutover_pairs
     else:
         cached = max(0, int(cutover))
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[cache_key] = cached
@@ -915,7 +980,13 @@ def _get_static_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
     if activation_precision == "fp4" and num_topk > 1:
-        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
+        static_tile_m = _launch_tuning(torch.device("cuda"), quant_mode).static_tile_m
+        if static_tile_m is not None:
+            mma_tiler_mn = (static_tile_m, 128)
+        else:
+            mma_tiler_mn = _select_moe_mma_tiler_mn(
+                routed_rows, n, resident_clusters=mac
+            )
 
     cache_key = _static_kernel_cache_key(
         activation_precision=activation_precision,
@@ -1416,6 +1487,7 @@ def _get_direct_micro_kernel(
     swiglu_limit: float | None = None,
     device: torch.device | None = None,
     input_scales_are_reciprocal: bool = False,
+    one_round_fc1: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 direct micro MoE kernel.
 
@@ -1444,6 +1516,7 @@ def _get_direct_micro_kernel(
         swiglu_limit,
         str(_canonical_cuda_device(device)) if device is not None else None,
         input_scales_are_reciprocal,
+        one_round_fc1,
     )
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
@@ -1464,6 +1537,7 @@ def _get_direct_micro_kernel(
         swiglu_beta=swiglu_beta,
         device=device,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
+        one_round_fc1=one_round_fc1,
     )
     compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
@@ -1565,13 +1639,14 @@ def launch_sm120_static_moe(
 
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
+    tuning = _launch_tuning(a.device, quant_mode)
     use_direct_micro = (
         quant_mode == "nvfp4"
         and workspace.state_E == num_experts
         and workspace.dm_barrier_count is not None
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
         and num_tokens <= _MICRO_MAX_TOKENS
-        and routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS
+        and routed_rows < tuning.direct_micro_cutover_pairs
         and n <= _DIRECT_MICRO_MAX_N
         and MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
     )
@@ -1614,6 +1689,7 @@ def launch_sm120_static_moe(
             swiglu_limit=swiglu_limit,
             device=a.device,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
+            one_round_fc1=tuning.direct_micro_one_round_fc1,
         )
         if not block_ok:
             if _FORCED_BACKEND == "direct_micro":
@@ -1671,7 +1747,7 @@ def launch_sm120_static_moe(
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
-    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
+    tuned_static_mac = _lookup_mac_ladder(tuning.static_mac_ladder, routed_rows)
     static_mac = min(tuned_static_mac or base_mac, base_mac)
     if activation_precision == "fp4" and not use_micro and routed_rows < 40:
         static_mac = min(static_mac, 64)
