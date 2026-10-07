@@ -25,6 +25,7 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from flashinfer.utils import get_compute_capability
 from .moe_activation import SWIGLUOAI_UNINTERLEAVE, is_gated_activation
 from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
@@ -124,6 +125,24 @@ _DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (640, 188),
     (1024, 147),
 )
+
+# NVFP4 launch values measured on RTX PRO 6000 (SM120, 188 SMs) with 256
+# experts, top-8, hidden 2048, intermediate 512. On that GPU they replace the
+# cutovers and the static M tile above, and the static grid keeps every
+# resident SM instead of _STATIC_MAC_LADDER.
+_SM120_NVFP4_DIRECT_MICRO_CUTOVER_PAIRS = 65
+_SM120_NVFP4_STATIC_COMPACT_CUTOVER_PAIRS = 2048
+_SM120_NVFP4_STATIC_TILE_M = 64
+
+
+def _is_sm120_nvfp4(device: torch.device, quant_mode: str | None) -> bool:
+    """Whether the SM120 NVFP4 launch values apply (never without a GPU)."""
+    return (
+        quant_mode == "nvfp4"
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+        and get_compute_capability(_canonical_cuda_device(device)) == (12, 0)
+    )
 
 
 def _lookup_mac_ladder(
@@ -298,11 +317,12 @@ def _get_static_compact_cutover_pairs(
         # Only the retained NVFP4 implementation earns the wider band; the
         # generic implementation (MXFP4, or unspecified quant mode) keeps
         # the original boundary.
-        cached = (
-            _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT
-            if quant_mode == "nvfp4"
-            else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-        )
+        if _is_sm120_nvfp4(torch.device("cuda"), quant_mode):
+            cached = _SM120_NVFP4_STATIC_COMPACT_CUTOVER_PAIRS
+        elif quant_mode == "nvfp4":
+            cached = _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT
+        else:
+            cached = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
     else:
         cached = max(0, int(cutover))
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[cache_key] = cached
@@ -915,7 +935,12 @@ def _get_static_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
     if activation_precision == "fp4" and num_topk > 1:
-        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
+        if _is_sm120_nvfp4(torch.device("cuda"), quant_mode):
+            mma_tiler_mn = (_SM120_NVFP4_STATIC_TILE_M, 128)
+        else:
+            mma_tiler_mn = _select_moe_mma_tiler_mn(
+                routed_rows, n, resident_clusters=mac
+            )
 
     cache_key = _static_kernel_cache_key(
         activation_precision=activation_precision,
@@ -1416,6 +1441,7 @@ def _get_direct_micro_kernel(
     swiglu_limit: float | None = None,
     device: torch.device | None = None,
     input_scales_are_reciprocal: bool = False,
+    one_round_fc1: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 direct micro MoE kernel.
 
@@ -1444,6 +1470,7 @@ def _get_direct_micro_kernel(
         swiglu_limit,
         str(_canonical_cuda_device(device)) if device is not None else None,
         input_scales_are_reciprocal,
+        one_round_fc1,
     )
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
@@ -1464,6 +1491,7 @@ def _get_direct_micro_kernel(
         swiglu_beta=swiglu_beta,
         device=device,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
+        one_round_fc1=one_round_fc1,
     )
     compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
@@ -1565,13 +1593,19 @@ def launch_sm120_static_moe(
 
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
+    sm120_nvfp4 = _is_sm120_nvfp4(a.device, quant_mode)
+    direct_micro_cutover_pairs = (
+        _SM120_NVFP4_DIRECT_MICRO_CUTOVER_PAIRS
+        if sm120_nvfp4
+        else _DIRECT_MICRO_CUTOVER_PAIRS
+    )
     use_direct_micro = (
         quant_mode == "nvfp4"
         and workspace.state_E == num_experts
         and workspace.dm_barrier_count is not None
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
         and num_tokens <= _MICRO_MAX_TOKENS
-        and routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS
+        and routed_rows < direct_micro_cutover_pairs
         and n <= _DIRECT_MICRO_MAX_N
         and MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
     )
@@ -1614,6 +1648,7 @@ def launch_sm120_static_moe(
             swiglu_limit=swiglu_limit,
             device=a.device,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
+            one_round_fc1=sm120_nvfp4,
         )
         if not block_ok:
             if _FORCED_BACKEND == "direct_micro":
@@ -1671,7 +1706,9 @@ def launch_sm120_static_moe(
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
-    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
+    tuned_static_mac = (
+        None if sm120_nvfp4 else _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
+    )
     static_mac = min(tuned_static_mac or base_mac, base_mac)
     if activation_precision == "fp4" and not use_micro and routed_rows < 40:
         static_mac = min(static_mac, 64)

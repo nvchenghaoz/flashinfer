@@ -67,6 +67,8 @@ _FC2_TILE_RECIP_GS_NUM = 6.0 * _FP8_E4M3_MAX
 _NUM_WARPS = 16
 _BLOCK_DIM = _NUM_WARPS * 32
 _K_PER_CTA = 16
+# FC1 rows each warp computes per task are unrolled; cap the unroll.
+_MAX_FC1_ROWS_PER_WARP = 16
 _MAX_DIRECT_K_SEGMENTS = 12
 _W4A16_PACKED_E4M3_SCALE_CACHE_VERSION = 1
 
@@ -640,11 +642,56 @@ class MoEDirectMicroKernel:
         *,
         max_active_ctas: int | None = None,
         device: torch.device | None = None,
+        one_round_fc1: bool = False,
     ):
         cfg = _make_shape_config(
             m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated
         )
-        num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
+        m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
+        m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
+        if m == 1:
+            fc2_tasks = cfg.k_dim // m1_fc2_rows
+        elif w4a16_rowpair_fc2:
+            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
+        else:
+            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
+        if max_active_ctas is None:
+            max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
+        one_round_fc1 = bool(
+            one_round_fc1
+            and not self.w4a16_mode
+            and not self.a8_mx_mode
+            and self.compile_time_phase == 0
+        )
+
+        def balanced_grid(tasks: int) -> int:
+            # Fewest CTAs that still finish ``tasks`` in the minimum number of
+            # rounds: extra CTAs add no throughput, but each one joins the
+            # all-CTA barrier and holds an SM that concurrent kernels could use.
+            cap = max(1, min(int(max_active_ctas), tasks))
+            rounds = -(-tasks // cap)
+            return max(1, -(-tasks // rounds))
+
+        if one_round_fc1:
+            # Every FC1 task re-stages its token's activations in shared memory
+            # before its dot products, so finish FC1 in one round over the grid
+            # FC2 needs: as many chunks per (token, expert) pair as still fit,
+            # each warp covering more rows (more weight loads in flight).
+            def valid_chunks(chunks: int) -> bool:
+                return n % chunks == 0 and (n // chunks) % _BLOCK_SIZE == 0
+
+            num_fc1_chunks = max(1, n // (_MAX_FC1_ROWS_PER_WARP * _NUM_WARPS))
+            while num_fc1_chunks > 1 and not valid_chunks(num_fc1_chunks):
+                num_fc1_chunks -= 1
+            fc2_grid = balanced_grid(fc2_tasks)
+            pairs = m * cfg.num_topk
+            for chunks in range(n // _BLOCK_SIZE, num_fc1_chunks, -1):
+                if valid_chunks(chunks) and pairs * chunks <= fc2_grid:
+                    num_fc1_chunks = chunks
+                    break
+        else:
+            num_fc1_chunks = _fc1_chunks_for_m(m, n)
         if self.w4a16_mode and m == 1 and n <= 2048:
             # 4 rows/warp only helps the k_segments==8 aligned gated path (its
             # reg-hoist + dual-dot assume 4 rows). The k_segments==12 path is
@@ -673,17 +720,6 @@ class MoEDirectMicroKernel:
         cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
-        w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
-        m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
-        m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
-        if m == 1:
-            fc2_tasks = cfg.k_dim // m1_fc2_rows
-        elif w4a16_rowpair_fc2:
-            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
-        else:
-            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
-        if max_active_ctas is None:
-            max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
         if self.compile_time_phase == 1:
             # A standalone FC1 phase has no cooperative-grid requirement.
             grid_x = max(1, fc1_tasks)
@@ -691,6 +727,9 @@ class MoEDirectMicroKernel:
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
+        elif one_round_fc1:
+            # FC1 in one round when it fits; FC2 in its fewest rounds.
+            grid_x = max(balanced_grid(fc2_tasks), min(fc1_tasks, int(max_active_ctas)))
         elif m in (1, 2):
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif num_fc1_chunks < 16:
@@ -5044,6 +5083,7 @@ def build_direct_micro_kernel(
     max_active_ctas: int | None = None,
     device: torch.device | None = None,
     input_scales_are_reciprocal: bool = False,
+    one_round_fc1: bool = False,
 ) -> MoEDirectMicroKernel:
     """Construct and configure a direct micro kernel for one problem shape.
 
@@ -5073,7 +5113,14 @@ def build_direct_micro_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
     kernel.configure(
-        m, k, n, num_topk, weight_E, max_active_ctas=max_active_ctas, device=device
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        max_active_ctas=max_active_ctas,
+        device=device,
+        one_round_fc1=one_round_fc1,
     )
     return kernel
 
