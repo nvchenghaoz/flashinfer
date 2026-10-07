@@ -176,12 +176,15 @@ def b12x_fused_moe(
     w2_alpha : torch.Tensor
         Per-expert global scale for FC2.
     fc2_input_scale : Optional[torch.Tensor]
-        Global scale for FC2 input quantization.  Required for
+        Global scale for FC2 input quantization, in dequantization form:
+        ``amax / (448 * 6)``, as ModelOpt checkpoints store ``input_scale``
+        (the reciprocal of ``fp4_quantize``'s ``global_scale``).  Required for
         ``quant_mode="nvfp4"``; ignored for ``"mxfp4"`` and
         ``"w4a16"``.
     input_global_scale : Optional[torch.Tensor]
         Global scale for FC1 input quantization, scalar or
-        ``[num_experts]``.  Lets ``w1_alpha`` carry the exact fp32 weight
+        ``[num_experts]``, in the same dequantization form as
+        ``fc2_input_scale``.  Lets ``w1_alpha`` carry the exact fp32 weight
         scale; folded into the output multiplier internally.  Defaults to
         ``w1_alpha``, which then serves both roles.  Ignored for
         ``quant_mode="mxfp4"`` and ``quant_mode="w4a16"``.
@@ -734,11 +737,15 @@ class B12xMoEWrapper:
         w2_alpha : torch.Tensor
             Per-expert global scale for FC2.
         fc2_input_scale : Optional[torch.Tensor]
-            Global scale for FC2 input quantization.  Required for
-            ``quant_mode="nvfp4"``; accepted but ignored for ``"w4a16"``.
+            Global scale for FC2 input quantization, in dequantization form:
+            ``amax / (448 * 6)``, as ModelOpt checkpoints store
+            ``input_scale`` (the reciprocal of ``fp4_quantize``'s
+            ``global_scale``).  Required for ``quant_mode="nvfp4"``; accepted
+            but ignored for ``"w4a16"``.
         input_global_scale : Optional[torch.Tensor]
             Global scale for FC1 input quantization, scalar or
-            ``[num_experts]``.  Defaults to ``w1_alpha``; see
+            ``[num_experts]``, in the same dequantization form as
+            ``fc2_input_scale``.  Defaults to ``w1_alpha``; see
             :func:`b12x_fused_moe`.  Ignored for ``"w4a16"``.
 
         Returns
