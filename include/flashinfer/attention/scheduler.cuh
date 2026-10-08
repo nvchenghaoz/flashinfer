@@ -543,22 +543,31 @@ inline cudaError_t DecodePlanWorkspaceSize(size_t& float_workspace_size_in_bytes
 
 /*!
  * \brief KV chunk size (in pages) for the FP8-MMA prefill kernel. Splitting the KV range pays only
- * when the batch fills less than two waves, where the last wave is mostly idle; every split adds
- * partial outputs to write and merge. Below two waves it picks the number of chunks with the lowest
- *   estimated time, waves x chunk length x (1 + 5% per extra chunk), trying up to as many chunks as
- *   fill one wave.
+ * when the batch fills less than two waves, where the last wave is mostly idle. Below two waves it
+ * picks the number of chunks with the lowest estimated time, in KV tokens one wave processes:
+ * waves x chunk length x (1 + 5% per extra chunk) for the attention, plus, when split, the merge
+ * pass, whose time grows with the number of (query token, head) rows and not with the KV length.
+ * It tries up to as many chunks as fill one wave.
  * \param wave_ctas CTAs of the kernel that run concurrently on the device.
  * \param num_kv_heads CTAs per (request, query tile, KV chunk).
+ * \param page_size Tokens per KV page (kv_len_arr and the result are in pages).
  * \return (split_kv, kv_chunk_size in pages)
  */
 inline std::tuple<bool, int64_t> PrefillWaveAwareKVChunkSize(
     int64_t wave_ctas, int64_t num_kv_heads, const std::vector<int64_t>& packed_qo_len_arr,
-    const std::vector<int64_t>& kv_len_arr, uint32_t cta_tile_q, uint32_t min_kv_chunk_size) {
+    const std::vector<int64_t>& kv_len_arr, uint32_t cta_tile_q, uint32_t min_kv_chunk_size,
+    uint32_t page_size) {
+  // Merge cost per (query token, head) row, in KV tokens of one wave of the attention kernel:
+  // measured on RTX PRO 6000 at head_dim 64 (0.11; head_dim 128 and 256 merge relatively faster,
+  // so this errs toward not splitting). Short KV over many rows is where it matters: e.g. 16
+  // requests of 256 new tokens over 2,304 merge in twice the time of the attention itself.
+  constexpr double kMergeTokensPerRow = 0.11;
   const int64_t wave = std::max<int64_t>(1, wave_ctas);
-  int64_t max_kv_len = 1, q_tiles = 0;
+  int64_t max_kv_len = 1, q_tiles = 0, merge_rows = 0;
   for (size_t i = 0; i < kv_len_arr.size(); ++i) {
     max_kv_len = std::max(max_kv_len, kv_len_arr[i]);
     q_tiles += ceil_div(packed_qo_len_arr[i], int64_t(cta_tile_q));
+    merge_rows += packed_qo_len_arr[i] * num_kv_heads;
   }
   auto num_ctas = [&](int64_t chunk) {
     int64_t items = 0;
@@ -577,8 +586,10 @@ inline std::tuple<bool, int64_t> PrefillWaveAwareKVChunkSize(
     const int64_t chunk = std::max<int64_t>(ceil_div(max_kv_len, num_chunks), min_kv_chunk_size);
     if (chunk == prev_chunk) continue;  // same split as fewer chunks
     prev_chunk = chunk;
+    const int64_t chunks = ceil_div(max_kv_len, chunk);
     const double cost = double(ceil_div(num_ctas(chunk), wave)) * double(chunk) *
-                        (1.0 + 0.05 * double(ceil_div(max_kv_len, chunk) - 1));
+                            double(page_size) * (1.0 + 0.05 * double(chunks - 1)) +
+                        (chunks > 1 ? kMergeTokensPerRow * double(merge_rows) : 0.0);
     if (num_chunks == 1 || cost < best_cost) {
       best_cost = cost;
       best_chunk = chunk;
@@ -718,7 +729,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
     std::tie(split_kv, kv_chunk_size) = PrefillWaveAwareKVChunkSize(
         int64_t(num_sm) * (head_dim >= 128 ? 1 : 2), num_kv_heads, packed_qo_len_arr,
-        effective_kv_len_arr, cta_tile_q, min_kv_chunk_size);
+        effective_kv_len_arr, cta_tile_q, min_kv_chunk_size, page_size);
   } else {
     std::tie(split_kv, kv_chunk_size) = PrefillBinarySearchKVChunkSize(
         enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
