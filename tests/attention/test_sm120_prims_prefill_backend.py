@@ -386,3 +386,90 @@ def test_prims_accepts_combined_hnd_cache_and_pdl():
     assert cache_after_runs.misses == cache_after_plan.misses
     assert cache_after_runs.currsize == cache_after_plan.currsize
     assert cache_after_runs.hits == cache_after_plan.hits + 2
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("fixed_split_size", [None, 8])
+@pytest.mark.parametrize("page_size", [16, 64])
+def test_paged_kv_split_matches_reference(causal, fixed_split_size, page_size):
+    # Few Q tiles over a long K/V underfill the GPU, so the plan splits the K/V range and merges.
+    hq, hkv, d = 8, 2, 128
+    q_lens, kv_lens = [130, 64], [1500, 1100]
+    pages = [-(-kv // page_size) for kv in kv_lens]
+    qo = torch.tensor([0, q_lens[0], sum(q_lens)], dtype=torch.int32, device="cuda")
+    page_indptr = torch.tensor(
+        [0, pages[0], sum(pages)], dtype=torch.int32, device="cuda"
+    )
+    page_indices = torch.randperm(sum(pages), device="cuda").to(torch.int32)
+    last_page_len = torch.tensor(
+        [kv - (p - 1) * page_size for kv, p in zip(kv_lens, pages, strict=True)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q = _fp8((sum(q_lens), hq, d))
+    cache = _fp8((sum(pages), 2, hkv, page_size, d))
+    k_pool, v_pool = cache.unbind(dim=1)
+    refs, ref_lses = [], []
+    for b in range(2):
+        idx = page_indices[page_indptr[b] : page_indptr[b + 1]]
+        k = torch.cat([k_pool[p].transpose(0, 1) for p in idx])[: kv_lens[b]]
+        v = torch.cat([v_pool[p].transpose(0, 1) for p in idx])[: kv_lens[b]]
+        ref, ref_lse = _reference(q[qo[b] : qo[b + 1]], k, v, causal, 1 / math.sqrt(d))
+        refs.append(ref)
+        ref_lses.append(ref_lse)
+    ref, ref_lse = torch.cat(refs), torch.cat(ref_lses)
+
+    errors = {}
+    for disable_split_kv in (False, True):
+        workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "HND", backend="cute-dsl-prims"
+        )
+        wrapper.plan(
+            qo,
+            page_indptr,
+            page_indices,
+            last_page_len,
+            hq,
+            hkv,
+            d,
+            page_size,
+            causal=causal,
+            q_data_type=q.dtype,
+            kv_data_type=k_pool.dtype,
+            o_data_type=torch.bfloat16,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+        )
+        split = wrapper._prims_backend._kv_split
+        assert (split is None) == disable_split_kv
+        out, lse = wrapper.run_return_lse(q, cache)
+        torch.testing.assert_close(out.float(), ref, atol=0.2, rtol=0.2)
+        torch.testing.assert_close(lse, ref_lse, atol=0.2, rtol=0.2)
+        errors[disable_split_kv] = float((out.float() - ref).norm() / ref.norm())
+    # Splitting changes where P is rounded to FP8, not how much: same error level as unsplit.
+    assert errors[False] <= 1.1 * errors[True] + 1e-3
+
+
+def test_paged_kv_split_bounds():
+    from flashinfer.attention.cute_dsl.sm120_fmha import _paged_kv_split_bounds
+
+    tile, wave = 128, 188
+    # One long-prefix request fills 1.4 waves: it is split, with every boundary inside the visible prefix.
+    bounds = _paged_kv_split_bounds([2048], [34816], 16, True, tile, wave, 0)
+    assert bounds is not None and len(bounds[0]) > 2
+    assert bounds[0][0] == 0 and bounds[0][-1] == 272
+    assert all(b <= (34816 - 2048) // tile for b in bounds[0][1:-1])
+    # Two such requests already fill two waves: no split.
+    assert (
+        _paged_kv_split_bounds([2048] * 2, [34816] * 2, 16, True, tile, wave, 0) is None
+    )
+    # A fresh causal prompt has no prefix every row sees: no split.
+    assert _paged_kv_split_bounds([4096], [4096], 16, True, tile, wave, 0) is None
+    # Fixed chunk size: 4,096 tokens over 32,768 gives 8 chunks of 32 tiles.
+    bounds = _paged_kv_split_bounds([64], [32768], 16, False, tile, wave, 4096)
+    assert bounds == [list(range(0, 257, 32))]
+    # Chunks always keep at least one tile inside the visible prefix.
+    bounds = _paged_kv_split_bounds([200], [600], 4, True, tile, wave, 128)
+    assert all(b[c] < b[c + 1] for b in bounds for c in range(len(b) - 1))
+    assert bounds[0][-2] <= (600 - 200) // tile

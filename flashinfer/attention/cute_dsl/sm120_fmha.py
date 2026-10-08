@@ -41,6 +41,7 @@ import math
 import os
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
+from types import SimpleNamespace
 from typing import Optional, Union
 
 import torch
@@ -383,6 +384,7 @@ def sm120_fmha_fp8_ragged_prefill(
         cu_seqlens_k_i32,
         Int32(max_seqlen_q),
         enable_pdl,
+        None,  # kv_tile_ranges
     )
 
 
@@ -408,6 +410,7 @@ def sm120_fmha_fp8_paged_prefill(
     v_scale: Optional[float] = None,
     enable_pdl: bool = False,
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
+    kv_tile_ranges: Optional[torch.Tensor] = None,
 ) -> None:
     """Run SM120 FP8 FMHA prefill with paged K/V cache.
 
@@ -470,6 +473,11 @@ def sm120_fmha_fp8_paged_prefill(
         avoid a device-to-host synchronization. ``None`` selects the dense
         specialization; every supplied value, including zero, selects the
         skip-enabled specialization.
+    kv_tile_ranges : torch.Tensor, optional
+        Split KV: int32 ``(B, 2)`` range ``[begin, end)`` of K/V tiles (``kv_tile`` tokens each) per batch item,
+        in the item's absolute K/V positions; the causal mask still uses the item's full ``seqlens_kv``. Items
+        whose range is empty after the causal limit write ``O = 0`` and ``LSE = -inf``. ``None`` covers the
+        whole range.
     Raises
     ------
     RuntimeError
@@ -551,6 +559,7 @@ def sm120_fmha_fp8_paged_prefill(
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
         enable_skip_softmax=threshold is not None,
+        **({"with_kv_tile_ranges": True} if kv_tile_ranges is not None else {}),
     )
 
     if sm_scale is None:
@@ -578,7 +587,70 @@ def sm120_fmha_fp8_paged_prefill(
         None,
         Int32(max_seqlen_q),
         enable_pdl,
+        kv_tile_ranges,
     )
+
+
+# Merge cost of split KV per (query token, head) row and chunk, in K/V tokens of one wave of the kernel: the
+# Q copy into the per-chunk items plus the merge, measured on RTX PRO 6000 (about 0.03 x (chunks + 1)).
+_KV_SPLIT_MERGE_TOKENS_PER_ROW = 0.03
+_KV_SPLIT_MAX_CHUNKS = 64
+
+
+def _paged_kv_split_bounds(
+    q_lens: list,
+    kv_lens: list,
+    num_qo_heads: int,
+    causal: bool,
+    tile: int,
+    num_ctas_per_wave: int,
+    fixed_split_tokens: int,
+) -> Optional[list]:
+    """K/V tile bounds ``bounds[r][c]`` (chunk ``c`` of request ``r`` covers tiles ``[bounds[r][c],
+    bounds[r][c + 1])``), or ``None`` to run unsplit.
+
+    The kernel runs one CTA per (Q tile, Q head, batch item), so a batch of few Q tiles over a long K/V leaves
+    SMs idle. Splitting every request's K/V into the same number of chunks multiplies the CTAs; a merge then
+    combines the partial outputs. Chunk boundaries stay inside the K/V prefix every query row sees, so each
+    (row, chunk) pair has keys. Without ``fixed_split_tokens`` the chunk count minimizes the estimated time in
+    K/V tokens of one wave: waves x chunk length, plus the Q copy and merge
+    (``_KV_SPLIT_MERGE_TOKENS_PER_ROW`` x (chunks + 1) per (query token, head) row). Batches that already fill
+    two waves are not split.
+    """
+    kv_tiles = [-(-kv // tile) for kv in kv_lens]
+    visible = [
+        (kv - q) // tile if causal else t
+        for q, kv, t in zip(q_lens, kv_lens, kv_tiles, strict=True)
+    ]
+    max_chunks = min([_KV_SPLIT_MAX_CHUNKS] + [v + 1 for v in visible])
+    if max_chunks < 2:
+        return None
+    ctas_per_chunk = sum(-(-q // tile) for q in q_lens) * num_qo_heads
+    max_kv = max(kv_lens)
+    if fixed_split_tokens > 0:
+        num_chunks = min(-(-max_kv // fixed_split_tokens), max_chunks)
+    else:
+        if ctas_per_chunk >= 2 * num_ctas_per_wave:
+            return None
+        rows = sum(q_lens) * num_qo_heads
+
+        def cost(n: int) -> float:
+            waves = -(-(n * ctas_per_chunk) // num_ctas_per_wave)
+            merge = _KV_SPLIT_MERGE_TOKENS_PER_ROW * (n + 1) * rows if n > 1 else 0.0
+            return waves * -(-max_kv // n) + merge
+
+        num_chunks = min(range(1, max_chunks + 1), key=cost)
+    if num_chunks < 2:
+        return None
+    bounds = []
+    for t, v in zip(kv_tiles, visible, strict=True):
+        b = [0]
+        for c in range(1, num_chunks):
+            target = round(c * t / num_chunks)
+            b.append(min(max(target, b[-1] + 1), v - (num_chunks - 1 - c)))
+        b.append(t)
+        bounds.append(b)
+    return bounds
 
 
 class SM120PrimsBatchPrefillBackend:
@@ -595,6 +667,7 @@ class SM120PrimsBatchPrefillBackend:
     def __init__(self, device: torch.device) -> None:
         _check_cutlass_dsl_version()
         self.device = torch.device(device)
+        self._split_buffers: dict = {}
         self._mode: Optional[str] = None
         self._compiled_lse_variants: set[bool] = set()
 
@@ -732,6 +805,9 @@ class SM120PrimsBatchPrefillBackend:
         page_size: int,
         causal: bool,
         sm_scale: Optional[float],
+        fixed_split_size: int = -1,
+        disable_split_kv: bool = False,
+        use_cuda_graph: bool = False,
     ) -> None:
         from flashinfer.cute_dsl.attention.fmha.sm120 import (
             compile_sm120_fmha_fp8_paged_kernel,
@@ -787,6 +863,111 @@ class SM120PrimsBatchPrefillBackend:
             enable_skip_softmax=False,
         )
         self._compiled_lse_variants = {False}
+        self._plan_kv_split(
+            qo_indptr_host=qo_indptr_host,
+            seqlens_kv_host=seqlens_kv_host,
+            seqlens_kv=seqlens_kv,
+            block_tables=block_tables,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    def _plan_kv_split(
+        self,
+        *,
+        qo_indptr_host: torch.Tensor,
+        seqlens_kv_host: torch.Tensor,
+        seqlens_kv: torch.Tensor,
+        block_tables: torch.Tensor,
+        fixed_split_size: int,
+        disable_split_kv: bool,
+        use_cuda_graph: bool,
+    ) -> None:
+        """Choose and prepare split KV for the paged plan (see ``_paged_kv_split_bounds``).
+
+        Batch items are laid out chunk-major (item ``c * batch_size + r`` is chunk ``c`` of request ``r``), so
+        the rows of chunk ``c`` line up with the output rows and the merge needs no reordering. The buffers are
+        sized here; CUDA-graph plans keep the unsplit path.
+        """
+        from flashinfer.cute_dsl.attention.fmha.sm120 import (
+            compile_sm120_fmha_fp8_paged_kernel,
+        )
+
+        self._kv_split = None
+        if disable_split_kv or use_cuda_graph:
+            return
+        tile = 128
+        q_lens = (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist()
+        kv_lens = seqlens_kv_host.tolist()
+        bounds = _paged_kv_split_bounds(
+            q_lens,
+            kv_lens,
+            self._num_qo_heads,
+            self._causal,
+            tile,
+            torch.cuda.get_device_properties(self.device).multi_processor_count,
+            fixed_split_size * self._page_size if fixed_split_size > 0 else 0,
+        )
+        if bounds is None:
+            return
+        num_chunks = len(bounds[0]) - 1
+        batch_size = len(q_lens)
+        total_q = int(qo_indptr_host[-1].item())
+        ranges = [
+            [bounds[r][c], bounds[r][c + 1]]
+            for c in range(num_chunks)
+            for r in range(batch_size)
+        ]
+        cu_q = [0]
+        for _ in range(num_chunks):
+            for q_len in q_lens:
+                cu_q.append(cu_q[-1] + q_len)
+        rows = num_chunks * total_q
+        heads, dim = self._num_qo_heads, self._head_dim
+        self._kv_split = SimpleNamespace(
+            num_chunks=num_chunks,
+            total_q=total_q,
+            kv_tile_ranges=self._int32_to_device(ranges),
+            cu_seqlens_q=self._int32_to_device(cu_q),
+            block_tables=block_tables.repeat(num_chunks, 1),
+            seqlens_kv=seqlens_kv.repeat(num_chunks),
+            q=self._split_buffer("q", (rows, heads, dim), self._q_dtype),
+            o=self._split_buffer("o", (rows, heads, dim), self._o_dtype),
+            lse=self._split_buffer("lse", (rows, heads), torch.float32),
+        )
+        compile_sm120_fmha_fp8_paged_kernel(
+            in_dtype=self._q_dtype,
+            out_dtype=self._o_dtype,
+            num_qo_heads=self._num_qo_heads,
+            num_kv_heads=self._num_kv_heads,
+            head_dim=self._head_dim,
+            is_causal=self._causal,
+            kv_tile=tile,
+            q_tile=128,
+            num_tokens_per_page=self._page_size,
+            device=self.device,
+            with_lse=True,
+            balanced_scheduler=_use_balanced_scheduler(self._causal),
+            enable_skip_softmax=False,
+            with_kv_tile_ranges=True,
+        )
+
+    def _int32_to_device(self, values: list) -> torch.Tensor:
+        # Pinned host memory and a non-blocking copy, so planning does not wait for the GPU.
+        host = torch.tensor(values, dtype=torch.int32, pin_memory=True)
+        return host.to(self.device, non_blocking=True)
+
+    def _split_buffer(
+        self, name: str, shape: tuple, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # Grow-only scratch buffers: successive plans reuse device memory.
+        numel = math.prod(shape)
+        buf = self._split_buffers.get(name)
+        if buf is None or buf.dtype != dtype or buf.numel() < numel:
+            buf = torch.empty(numel, dtype=dtype, device=self.device)
+            self._split_buffers[name] = buf
+        return buf[:numel].view(shape)
 
     def _validate_run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor
@@ -944,6 +1125,41 @@ class SM120PrimsBatchPrefillBackend:
         sm_scale *= self._scalar_scale("q_scale", q_scale)
         sm_scale *= self._scalar_scale("k_scale", k_scale)
         scale_v = self._scalar_scale("v_scale", v_scale)
+        split = self._kv_split
+        if split is not None:
+            from flashinfer.cascade import merge_state_in_place
+
+            n, rows = split.num_chunks, split.total_q
+            split.q.view(n, rows, *q.shape[1:]).copy_(
+                q.unsqueeze(0).expand(n, -1, -1, -1)
+            )
+            sm120_fmha_fp8_paged_prefill(
+                split.q,
+                k,
+                v,
+                split.o,
+                split.block_tables,
+                split.seqlens_kv,
+                split.cu_seqlens_q,
+                is_causal=self._causal,
+                sm_scale=sm_scale,
+                v_scale=scale_v,
+                max_seqlen_q=self._max_seqlen_q,
+                lse=split.lse,
+                enable_pdl=enable_pdl,
+                kv_tile_ranges=split.kv_tile_ranges,
+            )
+            o_chunks = split.o.view(n, rows, *out.shape[1:])
+            lse_chunks = split.lse.view(n, rows, -1)
+            for c in range(1, n):
+                merge_state_in_place(
+                    o_chunks[0], lse_chunks[0], o_chunks[c], lse_chunks[c]
+                )
+            out.copy_(o_chunks[0])
+            if return_lse:
+                lse.copy_(lse_chunks[0])
+                return out, lse
+            return out
         sm120_fmha_fp8_paged_prefill(
             q,
             k,
