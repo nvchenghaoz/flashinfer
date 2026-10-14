@@ -618,15 +618,19 @@ def _paged_kv_split_bounds(
     fixed_split_tokens: int,
     max_chunks: int,
     gqa_pack_size: int = 1,
+    q_tile: Optional[int] = None,
 ) -> Optional[list]:
     """K/V tile bounds per request and chunk, or ``None`` to run unsplit.
+
+    ``tile`` is the K/V tile; ``q_tile`` (default ``tile``) the Q tile.
 
     With ``fixed_split_tokens``, each request is cut at multiples of that length within its own visible
     prefix, so its bounds do not depend on the rest of the batch. Otherwise the chunk count minimizes the
     estimated time in K/V tiles: the larger of the longest CTAs' waves and the total CTA work spread over
     ``num_ctas_per_wave`` SMs.
     """
-    overhead = 4  # Fixed cost of one CTA (Q load, epilogue, merge share), in K/V tiles.
+    # Fixed cost of one CTA (Q load, epilogue, merge share): 512 tokens, in K/V tiles.
+    overhead = 512 / tile
     kv_tiles = [ceil_div(kv, tile) for kv in kv_lens]
     visible = [
         (kv - q) // tile if causal else t
@@ -654,13 +658,14 @@ def _paged_kv_split_bounds(
     max_chunks = min([128, max_chunks] + [v + 1 for v in visible])
     if max_chunks < 2:
         return None
-    q_tile_tokens = tile // gqa_pack_size
+    q_tile_tokens = (q_tile or tile) // gqa_pack_size
     ctas = [
         ceil_div(q, q_tile_tokens) * (num_qo_heads // gqa_pack_size) for q in q_lens
     ]
     longest_tiles = max(kv_tiles)
+    # CTAs with at least half the longest CTA's work all shape the last wave.
     longest_ctas = sum(
-        c for c, t in zip(ctas, kv_tiles, strict=True) if t == longest_tiles
+        c for c, t in zip(ctas, kv_tiles, strict=True) if 2 * t >= longest_tiles
     )
     total_ctas = sum(ctas)
     total_work = sum(c * t for c, t in zip(ctas, kv_tiles, strict=True))
@@ -701,13 +706,17 @@ class SM120PrimsBatchPrefillBackend:
     """
 
     _FP8_DTYPES = (torch.float8_e4m3fn,)
+    _16BIT_DTYPES = (torch.float16, torch.bfloat16)
     _OUT_DTYPES = (torch.float16, torch.bfloat16)
+    # 16-bit inputs keep their Q128 live state in registers only with 32-row K/V tiles.
+    _KV_TILE_16BIT = 32
 
     def __init__(self, device: torch.device) -> None:
         _check_cutlass_dsl_version()
         self.device = torch.device(device)
         self._split_buffers: dict = {}
         self._gqa_pack_size = 1
+        self._kv_tile = 128
         self._mode: Optional[str] = None
         self._compiled_lse_variants: set[bool] = set()
 
@@ -739,11 +748,13 @@ class SM120PrimsBatchPrefillBackend:
         head_dim_vo: int,
     ) -> None:
         _check_sm120(self.device)
-        if q_dtype not in self._FP8_DTYPES or kv_dtype != q_dtype:
+        if (
+            q_dtype not in self._FP8_DTYPES + self._16BIT_DTYPES
+            or kv_dtype != q_dtype
+        ):
             raise ValueError(
                 "backend='cute-dsl-prims' requires Q/K/V to have the same "
-                f"FP8 dtype (float8_e4m3fn); got q={q_dtype}, "
-                f"kv={kv_dtype}"
+                f"FP8, FP16 or BF16 dtype; got q={q_dtype}, kv={kv_dtype}"
             )
         if o_dtype not in self._OUT_DTYPES:
             raise ValueError(
@@ -888,7 +899,12 @@ class SM120PrimsBatchPrefillBackend:
         self._causal = causal
         self._sm_scale = sm_scale
         self._page_size = page_size
-        self._gqa_pack_size = _gqa_pack_size(num_qo_heads, num_kv_heads, 128)
+        if q_dtype in self._16BIT_DTYPES:
+            self._kv_tile = self._KV_TILE_16BIT
+            self._gqa_pack_size = 1
+        else:
+            self._kv_tile = 128
+            self._gqa_pack_size = _gqa_pack_size(num_qo_heads, num_kv_heads, 128)
         compile_sm120_fmha_fp8_paged_kernel(
             in_dtype=q_dtype,
             out_dtype=o_dtype,
@@ -896,7 +912,7 @@ class SM120PrimsBatchPrefillBackend:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
             is_causal=causal,
-            kv_tile=128,
+            kv_tile=self._kv_tile,
             q_tile=128,
             num_tokens_per_page=page_size,
             device=self.device,
@@ -939,7 +955,7 @@ class SM120PrimsBatchPrefillBackend:
             or float_workspace_buffer is None
         ):
             return
-        tile = 128
+        tile = self._kv_tile
         q_lens = (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist()
         kv_lens = seqlens_kv_host.tolist()
         total_q = int(qo_indptr_host[-1].item())
@@ -957,6 +973,7 @@ class SM120PrimsBatchPrefillBackend:
             fixed_split_size * self._page_size if fixed_split_size > 0 else 0,
             max(free_bytes // max(chunk_bytes, 1), 1),
             self._gqa_pack_size,
+            q_tile=128,
         )
         if bounds is None:
             return
@@ -1098,7 +1115,7 @@ class SM120PrimsBatchPrefillBackend:
                 num_kv_heads=self._num_kv_heads,
                 head_dim=self._head_dim,
                 is_causal=self._causal,
-                kv_tile=128,
+                kv_tile=self._kv_tile,
                 q_tile=128,
                 num_tokens_per_page=self._page_size,
                 device=self.device,
@@ -1204,6 +1221,7 @@ class SM120PrimsBatchPrefillBackend:
                 enable_pdl=enable_pdl,
                 kv_tile_ranges=split.kv_tile_ranges,
                 gqa_pack_size=self._gqa_pack_size,
+                kv_tile=self._kv_tile,
             )
             rows, n = split.total_q, split.num_chunks
             get_cascade_module().merge_states(
@@ -1230,6 +1248,7 @@ class SM120PrimsBatchPrefillBackend:
             lse=lse,
             enable_pdl=enable_pdl,
             gqa_pack_size=self._gqa_pack_size,
+            kv_tile=self._kv_tile,
         )
         if return_lse:
             return out, lse

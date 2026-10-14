@@ -576,7 +576,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   }
 
   // step 2: determine cta_tile_q, kv_chunk_size and total_num_tiles_q
-  const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
+  const uint32_t min_kv_chunk_size = std::max((1536 / page_size), 1U);
   uint32_t cta_tile_q;
   uint32_t total_num_tiles_q;
   if (enable_cuda_graph) {
@@ -785,7 +785,7 @@ inline cudaError_t PrefillPlanImpl(
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-  int num_blocks_per_sm = 2;
+  int num_blocks_per_sm = 12;
   int64_t available_ctas = static_cast<int64_t>(num_blocks_per_sm) * num_sm - num_colocated_ctas;
   int max_grid_size = static_cast<int>(std::max<int64_t>(0, available_ctas));
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
