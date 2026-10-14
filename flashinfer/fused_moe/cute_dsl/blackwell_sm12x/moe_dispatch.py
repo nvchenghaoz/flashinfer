@@ -25,6 +25,7 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from flashinfer.utils import get_compute_capability
 from .moe_activation import SWIGLUOAI_UNINTERLEAVE, is_gated_activation
 from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
@@ -76,17 +77,15 @@ _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
 # The micro kernel's per-token staging assumes decode-sized batches.
 _MICRO_MAX_TOKENS = 8
-# Direct micro takes the smallest decode batches ahead of the MMA micro
-# kernel, and only at small intermediate sizes where its CUDA-core dots
-# keep up with per-token work. Measured on GB10, pending other GPUs.
-_DIRECT_MICRO_CUTOVER_PAIRS = 32
+# Direct micro only runs at small intermediate sizes, where its CUDA-core dots
+# keep up with per-token work.
 _DIRECT_MICRO_MAX_N = 512
+
+
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
 # "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
 _FORCED_BACKEND: str | None = None
-_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
-_STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-_STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
+_STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[Tuple[str, str], int] = {}
 
 # MAC (max active clusters) tuning ladders from b12x decode profiling.
 # Each entry is (max_routed_rows, optimal_mac).
@@ -115,12 +114,77 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (512, 175),
     (640, 188),
 )
-# Workloads at or below the static cutover (640 routed pairs by default)
-# take the static kernel, so only the 1024 entry is normally reachable.
+# Workloads at or below the static cutover (640 routed pairs in
+# _BASE_TUNING) take the static kernel, so only the 1024 entry is normally
+# reachable.
 _DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (640, 188),
     (1024, 147),
 )
+
+
+@dataclass(frozen=True)
+class _LaunchTuning:
+    """Size cutovers and launch shapes measured on one SM12x GPU."""
+
+    # Direct micro takes routed (token, expert) pairs below this count, ahead
+    # of the MMA micro and static kernels.
+    direct_micro_cutover_pairs: int
+    # Static kernel M tile; None keeps _select_moe_mma_tiler_mn's choice.
+    static_tile_m: int | None
+    # Direct micro sizes FC1 work to finish in one round over its grid (see
+    # MoEDirectMicroKernel.configure).
+    direct_micro_one_round_fc1: bool
+    # Routed pairs up to which the static kernel runs; the dynamic kernel takes
+    # larger batches. A static workspace holds this many rows per expert, so the
+    # cutover also sets each B12xMoEWrapper's static workspace size.
+    static_cutover_pairs: int
+    # Static kernel persistent-grid size per routed-row count (see
+    # _lookup_mac_ladder); empty keeps every resident SM.
+    static_mac_ladder: Tuple[Tuple[int, int], ...]
+
+
+# Measured on GB10 (SM121, 48 SMs); also used for formats not tuned on other
+# GPUs (MXFP4).
+_BASE_TUNING = _LaunchTuning(
+    direct_micro_cutover_pairs=32,
+    static_tile_m=None,
+    direct_micro_one_round_fc1=False,
+    static_cutover_pairs=640,
+    static_mac_ladder=_STATIC_MAC_LADDER,
+)
+# Measured on RTX PRO 6000 (SM120, 188 SMs) with 256 experts, top-8, hidden
+# 2048, intermediate 512, in the model's order (router GEMM, then the experts,
+# with a W4A4 shared expert on a second stream):
+# - direct micro up to 8 tokens;
+# - M64 static tiles, which skip half the per-tile activation, quantize, FC2
+#   and scatter work on rows that carry no tokens when experts see a handful
+#   of rows each;
+# - static kernel up to 256 tokens: with M64 tiles it stays ahead of the
+#   dynamic kernel up to ~320 tokens, but past 256 the gain is under 1% while
+#   the static workspace (~0.6 GiB per wrapper at 2048 rows) keeps growing;
+# - every resident SM in the static grid: its task count depends on how many
+#   distinct experts the routing touches.
+_SM120_NVFP4_TUNING = _LaunchTuning(
+    direct_micro_cutover_pairs=65,
+    static_tile_m=64,
+    direct_micro_one_round_fc1=True,
+    static_cutover_pairs=2048,
+    static_mac_ladder=(),
+)
+
+
+def _launch_tuning(device: torch.device, quant_mode: str = "nvfp4") -> _LaunchTuning:
+    """The launch tuning measured for this GPU and format.
+
+    Only NVFP4 on SM120 has its own values; every other GPU and format keeps
+    the values first measured on GB10.
+    """
+    if quant_mode == "nvfp4" and get_compute_capability(
+        _canonical_cuda_device(device)
+    ) == (12, 0):
+        return _SM120_NVFP4_TUNING
+    return _BASE_TUNING
 
 
 def _lookup_mac_ladder(
@@ -270,9 +334,13 @@ def _select_dynamic_tile_m(
     return _LEVEL_TILE_M
 
 
-def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
+def _get_static_compact_cutover_pairs(
+    activation_precision: str = "fp4", quant_mode: str = "nvfp4"
+) -> int:
     activation_precision = _normalize_activation_precision(activation_precision)
-    cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(activation_precision)
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    cache_key = (activation_precision, quant_mode)
+    cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -284,10 +352,10 @@ def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
     )
     cutover = _first_env(*cutover_names)
     if cutover is None:
-        cached = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+        cached = _launch_tuning(torch.device("cuda"), quant_mode).static_cutover_pairs
     else:
         cached = max(0, int(cutover))
-    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[activation_precision] = cached
+    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[cache_key] = cached
     return cached
 
 
@@ -375,8 +443,6 @@ class Sm120StaticMoEWorkspace:
     dm_barrier_count: torch.Tensor | None = None
     dm_barrier_epoch: torch.Tensor | None = None
     dm_intermediate: torch.Tensor | None = None
-    dm_input_gs: torch.Tensor | None = None
-    dm_down_input_scale: torch.Tensor | None = None
 
 
 def _direct_micro_candidate(k: int, n: int, num_topk: int, weight_E: int) -> bool:
@@ -482,12 +548,6 @@ def allocate_sm120_static_workspace(
         )
         workspace.dm_intermediate = torch.empty(
             dm_inter, dtype=torch.float32, device=device
-        )
-        workspace.dm_input_gs = torch.empty(
-            weight_E, dtype=torch.float32, device=device
-        )
-        workspace.dm_down_input_scale = torch.empty(
-            weight_E, dtype=torch.float32, device=device
         )
     return workspace
 
@@ -695,7 +755,6 @@ def _static_kernel_cache_key(
     quant_mode: str,
     state_E: int,
     weight_E: int,
-    m: int,
     k: int,
     n: int,
     num_topk: int,
@@ -713,7 +772,9 @@ def _static_kernel_cache_key(
     """The static kernel's cache key: every parameter affecting its codegen.
 
     Single source of truth for both cache levels — the in-process dict and,
-    through :func:`_disk_kernel_name`, the on-disk artifact name.
+    through :func:`_disk_kernel_name`, the on-disk artifact name. Free of
+    ``m``: the token count is a symbolic dimension of the compiled kernel
+    (``m`` only influences the tile choice, which is part of the key).
     """
     return (
         "static",
@@ -721,7 +782,6 @@ def _static_kernel_cache_key(
         quant_mode,
         state_E,
         weight_E,
-        m,
         k,
         n,
         num_topk,
@@ -875,14 +935,19 @@ def _get_static_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
     if activation_precision == "fp4" and num_topk > 1:
-        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
+        static_tile_m = _launch_tuning(torch.device("cuda"), quant_mode).static_tile_m
+        if static_tile_m is not None:
+            mma_tiler_mn = (static_tile_m, 128)
+        else:
+            mma_tiler_mn = _select_moe_mma_tiler_mn(
+                routed_rows, n, resident_clusters=mac
+            )
 
     cache_key = _static_kernel_cache_key(
         activation_precision=activation_precision,
         quant_mode=quant_mode,
         state_E=state_E,
         weight_E=weight_E,
-        m=m,
         k=k,
         n=n,
         num_topk=num_topk,
@@ -925,10 +990,14 @@ def _get_static_kernel(
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // sf_vec_size, 4)
 
-    # Build fake tensors for compilation
+    # Build fake tensors for compilation. The token count is symbolic: the
+    # kernel reads it from the tensor shapes at run time, so one compiled
+    # kernel serves every batch size.
+    sym_tokens = cute.sym_int()
+    sym_pairs = cute.sym_int()
     a_input_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -938,12 +1007,12 @@ def _get_static_kernel(
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
     topk_ids_fake = cute.runtime.make_fake_compact_tensor(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=topk_ids_align,
     )
     topk_weights_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=4,
     )
     packed_a_fake = cute.runtime.make_fake_compact_tensor(
@@ -1029,7 +1098,7 @@ def _get_static_kernel(
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -1048,7 +1117,7 @@ def _get_static_kernel(
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        _disk_kernel_name(f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
+        _disk_kernel_name(f"static_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
         lambda: cute.compile(
             kernel,
             a_input_fake,
@@ -1362,6 +1431,8 @@ def _get_direct_micro_kernel(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     device: torch.device | None = None,
+    invert_input_scales: bool = False,
+    one_round_fc1: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 direct micro MoE kernel.
 
@@ -1389,6 +1460,8 @@ def _get_direct_micro_kernel(
         swiglu_beta,
         swiglu_limit,
         str(_canonical_cuda_device(device)) if device is not None else None,
+        invert_input_scales,
+        one_round_fc1,
     )
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
@@ -1408,6 +1481,8 @@ def _get_direct_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         device=device,
+        invert_input_scales=invert_input_scales,
+        one_round_fc1=one_round_fc1,
     )
     compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
@@ -1509,13 +1584,14 @@ def launch_sm120_static_moe(
 
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
+    tuning = _launch_tuning(a.device, quant_mode)
     use_direct_micro = (
         quant_mode == "nvfp4"
         and workspace.state_E == num_experts
         and workspace.dm_barrier_count is not None
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
         and num_tokens <= _MICRO_MAX_TOKENS
-        and routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS
+        and routed_rows < tuning.direct_micro_cutover_pairs
         and n <= _DIRECT_MICRO_MAX_N
         and MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
     )
@@ -1557,37 +1633,25 @@ def launch_sm120_static_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             device=a.device,
+            # The MMA kernels take these scales as given unless flagged
+            # reciprocal; direct micro multiplies by them, so it inverts the
+            # unflagged form when loading.
+            invert_input_scales=not input_scales_are_reciprocal,
+            one_round_fc1=tuning.direct_micro_one_round_fc1,
         )
         if not block_ok:
             if _FORCED_BACKEND == "direct_micro":
                 raise RuntimeError("compiled direct micro MoE kernel cannot launch")
             use_direct_micro = False
     if use_direct_micro:
-        # The kernel takes multiplier-form scales only; invert reciprocal
-        # inputs into the persistent workspace planes (zeros stay zero,
-        # matching the MMA kernels).
-        if input_scales_are_reciprocal:
-            workspace.dm_input_gs.copy_(
-                torch.where(input_gs != 0, 1.0 / input_gs, input_gs)
-            )
-            workspace.dm_down_input_scale.copy_(
-                torch.where(
-                    down_input_scale != 0, 1.0 / down_input_scale, down_input_scale
-                )
-            )
-            launch_gs = workspace.dm_input_gs
-            launch_down = workspace.dm_down_input_scale
-        else:
-            launch_gs = input_gs
-            launch_down = down_input_scale
         MoEDirectMicroKernel.launch(
             compiled,
             x=a,
             w1_fp4=weights.w1_storage,
             w1_blockscale=weights.w1_scale_storage,
             w1_alphas=weights.w1_alpha,
-            a1_gscale=launch_gs,
-            a2_gscale=launch_down,
+            a1_gscale=input_gs,
+            a2_gscale=down_input_scale,
             inter_fp32=workspace.dm_intermediate,
             w2_fp4=weights.w2_storage,
             w2_blockscale=weights.w2_scale_storage,
@@ -1631,7 +1695,7 @@ def launch_sm120_static_moe(
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
-    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
+    tuned_static_mac = _lookup_mac_ladder(tuning.static_mac_ladder, routed_rows)
     static_mac = min(tuned_static_mac or base_mac, base_mac)
     if activation_precision == "fp4" and not use_micro and routed_rows < 40:
         static_mac = min(static_mac, 64)
@@ -1777,7 +1841,7 @@ def select_sm120_moe_backend(
         # Both micro variants launch through the static workspace path.
         return "static"
     routed_rows = num_tokens * num_topk
-    if routed_rows <= _get_static_compact_cutover_pairs("fp4"):
+    if routed_rows <= _get_static_compact_cutover_pairs("fp4", mode):
         return "static"
     return "dynamic"
 

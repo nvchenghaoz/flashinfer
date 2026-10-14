@@ -255,10 +255,11 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
 
     _clear_static_cutover_env(monkeypatch)
     moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+    cutover = moe_dispatch._launch_tuning(torch.device("cuda")).static_cutover_pairs
     try:
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=80,
+                num_tokens=cutover // 8,
                 num_topk=8,
                 activation_precision="fp4",
             )
@@ -266,7 +267,7 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
         )
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=81,
+                num_tokens=cutover // 8 + 1,
                 num_topk=8,
                 activation_precision="fp4",
             )
@@ -300,7 +301,10 @@ def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
     moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     monkeypatch.setenv("FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS", "256")
     try:
-        assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 640
+        assert (
+            moe_dispatch._get_static_compact_cutover_pairs("fp4")
+            == moe_dispatch._launch_tuning(torch.device("cuda")).static_cutover_pairs
+        )
         assert (
             moe_dispatch.select_sm120_moe_backend(
                 num_tokens=32,
@@ -1222,6 +1226,70 @@ class TestB12xFunctional:
             fc2_input_scale=tensors["fc2_input_scale"],
             activation=activation,
             swiglu_limit=swiglu_limit,
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
+
+    @pytest.mark.parametrize("num_tokens", [64, 65, 128])
+    def test_static_m64_tile_expert_spanning_tiles(self, num_tokens: int, monkeypatch):
+        """Static kernel with M64 tiles when one expert's rows span several tiles.
+
+        Every token routes to experts 0 and 1, so each holds ``num_tokens`` rows.
+        """
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "static")
+        monkeypatch.setattr(
+            moe_dispatch, "_select_moe_mma_tiler_mn", lambda *args, **kwargs: (64, 128)
+        )
+        monkeypatch.setattr(
+            moe_dispatch,
+            "_launch_tuning",
+            lambda *args, **kwargs: moe_dispatch._BASE_TUNING,
+        )
+        hidden_size, intermediate_size = 1536, 768
+        num_experts, top_k = 8, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        skewed = torch.tensor(
+            [[0, 1]] * num_tokens,
+            dtype=tensors["token_selected_experts"].dtype,
+            device=tensors["token_selected_experts"].device,
+        )
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=skewed,
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+        )
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=skewed,
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
         )
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
@@ -2283,6 +2351,86 @@ class TestMicroKernel:
             f"Direct micro: {percent_within * 100:.2f}% within tolerance "
             f"(atol={atol:.4f}, act={activation}, tokens={num_tokens}, "
             f"top_k={top_k})"
+        )
+
+    @pytest.mark.parametrize("per_expert_scales", [False, True])
+    @pytest.mark.parametrize("num_tokens", [1, 2, 8])
+    def test_direct_micro_matches_static_with_calibrated_input_scales(
+        self, monkeypatch, num_tokens: int, per_expert_scales: bool
+    ):
+        """Direct micro reads the activation global scales like the MMA kernels.
+
+        Calibrated scales (amax / (448 * 6)) are far from 1, so reading them in
+        the wrong form rescales the output. The shared test tensors use unit
+        scales, where every form agrees.
+        """
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        x = tensors["x_bf16"]
+        fp4_range = 448.0 * 6.0
+        fc1_scale = (x.float().abs().amax() / fp4_range).reshape(1)
+        if per_expert_scales:
+            fc1_scale = fc1_scale * torch.linspace(
+                1.0, 2.0, num_experts, device=x.device
+            )
+        # Covers the FC2 activations of these weights with headroom.
+        fc2_scale = torch.tensor([1.0 / fp4_range], device=x.device)
+
+        def run(backend: str) -> torch.Tensor:
+            monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", backend)
+            return b12x_fused_moe(
+                x=x,
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=fc2_scale,
+                input_global_scale=fc1_scale,
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"] * fc2_scale,
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_experts=num_experts,
+                top_k=top_k,
+            ).float()
+
+        direct_micro = run("direct_micro")
+        static = run("static")
+
+        rel_diff = ((direct_micro - static).norm() / static.norm()).item()
+        assert rel_diff < 0.05, (
+            f"direct micro vs static: relative difference {rel_diff:.4f} "
+            f"(tokens={num_tokens}, per_expert_scales={per_expert_scales})"
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=x.float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=1.0 / fc2_scale,
+        )
+        passed, percent_within, atol = check_accuracy(direct_micro, ref_output)
+        assert passed, (
+            f"Direct micro: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
         )
 
     @pytest.mark.parametrize("num_tokens", [1, 2, 4])

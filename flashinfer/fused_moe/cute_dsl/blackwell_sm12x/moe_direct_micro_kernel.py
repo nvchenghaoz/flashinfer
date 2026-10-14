@@ -67,6 +67,8 @@ _FC2_TILE_RECIP_GS_NUM = 6.0 * _FP8_E4M3_MAX
 _NUM_WARPS = 16
 _BLOCK_DIM = _NUM_WARPS * 32
 _K_PER_CTA = 16
+# FC1 rows each warp computes per task are unrolled; cap the unroll.
+_MAX_FC1_ROWS_PER_WARP = 16
 _MAX_DIRECT_K_SEGMENTS = 12
 _W4A16_PACKED_E4M3_SCALE_CACHE_VERSION = 1
 
@@ -319,8 +321,9 @@ class MoEDirectMicroKernel:
     """Decode-focused direct-routed MoE kernel for SM12x.
 
     Scale contract: w1_alphas/input_gs/down_input_scale are per-expert
-    [weight_E] f32 tensors, with input_gs and down_input_scale in multiplier
-    form; reciprocal-form scales must be inverted host-side before launch.
+    [weight_E] f32 tensors. This kernel multiplies by input_gs and
+    down_input_scale; with ``invert_input_scales=True`` it takes them in the
+    form the MMA kernels consume and inverts them on load (zero stays zero).
     """
 
     def __init__(
@@ -344,6 +347,7 @@ class MoEDirectMicroKernel:
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         w13_layout: str = "w13",
+        invert_input_scales: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if int(compile_time_phase) not in {0, 1, 2}:
@@ -368,6 +372,10 @@ class MoEDirectMicroKernel:
         self.e8m0_scale_layout = e8m0_scale_layout
         self.e8m0_scale_layout_logical = e8m0_scale_layout == "logical"
         self.w13_layout = w13_layout
+        # True when input_gs / down_input_scale arrive in the form the MMA
+        # kernels consume; this kernel multiplies by the reciprocal, so it
+        # inverts them on load (zero stays zero).
+        self.invert_input_scales = bool(invert_input_scales)
         # "w31" (gate_up) keeps the gate half first; "w13" (up_gate) keeps up first.
         self.w13_gate_first = w13_layout == "w31"
         self.has_swiglu_limit = swiglu_limit is not None
@@ -415,6 +423,7 @@ class MoEDirectMicroKernel:
             self.scale_format,
             self.e8m0_scale_layout,
             self.w13_layout,
+            self.invert_input_scales,
             self.has_swiglu_limit,
             self.swiglu_limit,
             self.swiglu_alpha,
@@ -636,11 +645,56 @@ class MoEDirectMicroKernel:
         *,
         max_active_ctas: int | None = None,
         device: torch.device | None = None,
+        one_round_fc1: bool = False,
     ):
         cfg = _make_shape_config(
             m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated
         )
-        num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
+        m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
+        m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
+        if m == 1:
+            fc2_tasks = cfg.k_dim // m1_fc2_rows
+        elif w4a16_rowpair_fc2:
+            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
+        else:
+            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
+        if max_active_ctas is None:
+            max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
+        one_round_fc1 = bool(
+            one_round_fc1
+            and not self.w4a16_mode
+            and not self.a8_mx_mode
+            and self.compile_time_phase == 0
+        )
+
+        def balanced_grid(tasks: int) -> int:
+            # Fewest CTAs that still finish ``tasks`` in the minimum number of
+            # rounds: extra CTAs add no throughput, but each one joins the
+            # all-CTA barrier and holds an SM that concurrent kernels could use.
+            cap = max(1, min(int(max_active_ctas), tasks))
+            rounds = -(-tasks // cap)
+            return max(1, -(-tasks // rounds))
+
+        if one_round_fc1:
+            # Every FC1 task re-stages its token's activations in shared memory
+            # before its dot products, so finish FC1 in one round over the grid
+            # FC2 needs: as many chunks per (token, expert) pair as still fit,
+            # each warp covering more rows (more weight loads in flight).
+            def valid_chunks(chunks: int) -> bool:
+                return n % chunks == 0 and (n // chunks) % _BLOCK_SIZE == 0
+
+            num_fc1_chunks = max(1, n // (_MAX_FC1_ROWS_PER_WARP * _NUM_WARPS))
+            while num_fc1_chunks > 1 and not valid_chunks(num_fc1_chunks):
+                num_fc1_chunks -= 1
+            fc2_grid = balanced_grid(fc2_tasks)
+            pairs = m * cfg.num_topk
+            for chunks in range(n // _BLOCK_SIZE, num_fc1_chunks, -1):
+                if valid_chunks(chunks) and pairs * chunks <= fc2_grid:
+                    num_fc1_chunks = chunks
+                    break
+        else:
+            num_fc1_chunks = _fc1_chunks_for_m(m, n)
         if self.w4a16_mode and m == 1 and n <= 2048:
             # 4 rows/warp only helps the k_segments==8 aligned gated path (its
             # reg-hoist + dual-dot assume 4 rows). The k_segments==12 path is
@@ -669,17 +723,6 @@ class MoEDirectMicroKernel:
         cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
-        w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
-        m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
-        m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
-        if m == 1:
-            fc2_tasks = cfg.k_dim // m1_fc2_rows
-        elif w4a16_rowpair_fc2:
-            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
-        else:
-            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
-        if max_active_ctas is None:
-            max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
         if self.compile_time_phase == 1:
             # A standalone FC1 phase has no cooperative-grid requirement.
             grid_x = max(1, fc1_tasks)
@@ -687,6 +730,9 @@ class MoEDirectMicroKernel:
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
+        elif one_round_fc1:
+            # FC1 in one round when it fits; FC2 in its fewest rounds.
+            grid_x = max(balanced_grid(fc2_tasks), min(fc1_tasks, int(max_active_ctas)))
         elif m in (1, 2):
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif num_fc1_chunks < 16:
@@ -705,6 +751,15 @@ class MoEDirectMicroKernel:
         self.m1_fc2_rows_per_cta = m1_fc2_rows
         self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
         self.grid_x = grid_x
+
+    @cute.jit
+    def _multiplier_scale(self, value: Float32) -> Float32:
+        """Activation global scale in this kernel's multiplier form."""
+        result = Float32(value)
+        if cutlass.const_expr(self.invert_input_scales):
+            if result != Float32(0.0):
+                result = Float32(1.0) / result
+        return result
 
     @cute.jit
     def _resident_grid_barrier(
@@ -2128,7 +2183,7 @@ class MoEDirectMicroKernel:
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (
                     route_idx_0 - t0 * Int32(cfg.num_topk)
                 )
-                gs_fc1_0 = input_gs[Int32(topk_ids[eid_addr_0])]
+                gs_fc1_0 = self._multiplier_scale(input_gs[Int32(topk_ids[eid_addr_0])])
                 in_blk = tidx
                 while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                     x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
@@ -2216,8 +2271,8 @@ class MoEDirectMicroKernel:
                 gs_fc2 = Float32(1.0)
             else:
                 alpha_fc1 = w1_alphas[eid]
-                gs_fc1 = input_gs[eid]
-                gs_fc2 = down_input_scale[eid]
+                gs_fc1 = self._multiplier_scale(input_gs[eid])
+                gs_fc2 = self._multiplier_scale(down_input_scale[eid])
                 if cutlass.const_expr(self.a8_mx_mode):
                     # a8_mx activations are self-ranging: fold the calibrated
                     # input global scale out of the combined nvfp4 alpha.
@@ -4446,7 +4501,9 @@ class MoEDirectMicroKernel:
                     next_eid_addr = t_next * Int32(cfg.num_topk) + (
                         next_route - t_next * Int32(cfg.num_topk)
                     )
-                    gs_fc1_next = input_gs[Int32(topk_ids[next_eid_addr])]
+                    gs_fc1_next = self._multiplier_scale(
+                        input_gs[Int32(topk_ids[next_eid_addr])]
+                    )
                     next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
                     in_blk = tidx
                     while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
@@ -5001,6 +5058,8 @@ def build_direct_micro_kernel(
     swiglu_beta: float | None = None,
     max_active_ctas: int | None = None,
     device: torch.device | None = None,
+    invert_input_scales: bool = False,
+    one_round_fc1: bool = False,
 ) -> MoEDirectMicroKernel:
     """Construct and configure a direct micro kernel for one problem shape.
 
@@ -5027,9 +5086,17 @@ def build_direct_micro_kernel(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        invert_input_scales=invert_input_scales,
     )
     kernel.configure(
-        m, k, n, num_topk, weight_E, max_active_ctas=max_active_ctas, device=device
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        max_active_ctas=max_active_ctas,
+        device=device,
+        one_round_fc1=one_round_fc1,
     )
     return kernel
 

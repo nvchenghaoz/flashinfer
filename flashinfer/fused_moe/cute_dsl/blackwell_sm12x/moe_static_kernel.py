@@ -2086,8 +2086,13 @@ class MoEStaticKernel:
                         warp_epi_rows = (
                             valid_rows - tile_m_base - rows_offset - warp_m_base
                         )
-                        if warp_epi_rows > Int32(64):
-                            warp_epi_rows = Int32(64)
+                        # Rows this warp's quadrant holds in the epilogue tile:
+                        # 64, or none for the upper warps of an M64 tile.
+                        quadrant_rows = Int32(self.epi_tile[0]) - warp_m_base
+                        if quadrant_rows > Int32(64):
+                            quadrant_rows = Int32(64)
+                        if warp_epi_rows > quadrant_rows:
+                            warp_epi_rows = quadrant_rows
                         if warp_epi_rows < Int32(0):
                             warp_epi_rows = Int32(0)
 
