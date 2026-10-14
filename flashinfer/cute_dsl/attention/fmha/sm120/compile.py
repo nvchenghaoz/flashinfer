@@ -159,6 +159,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
     with_kv_tile_ranges: bool = False,
+    gqa_pack_size: int = 1,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -178,6 +179,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         use_paged_kv=True,
         num_tokens_per_page=num_tokens_per_page,
         balanced_scheduler=balanced_scheduler,
+        gqa_pack_size=gqa_pack_size,
     )
 
     sym_b = cute.sym_int()
@@ -186,6 +188,8 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     sym_total_q = cute.sym_int()
     sym_seqlens = cute.sym_int()
     sym_cu_q = cute.sym_int()
+    # Split KV writes num_chunks partial O/LSE rows per Q token.
+    sym_total_o = cute.sym_int() if with_kv_tile_ranges else sym_total_q
     fake_q = make_fake_compact_tensor(
         in_ct,
         (sym_total_q, num_qo_heads, head_dim),
@@ -194,14 +198,14 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     )
     fake_o = make_fake_compact_tensor(
         out_ct,
-        (sym_total_q, num_qo_heads, head_dim),
+        (sym_total_o, num_qo_heads, head_dim),
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
     fake_lse = (
         make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_total_q, num_qo_heads),
+            (sym_total_o, num_qo_heads),
             stride_order=(1, 0),
             assumed_align=16,
         )
@@ -362,6 +366,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
     with_kv_tile_ranges: bool = False,
+    gqa_pack_size: int = 1,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -378,6 +383,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
         f"_balanced{int(balanced_scheduler)}"
         f"_skip{int(enable_skip_softmax)}"
         + ("_kvsplit1" if with_kv_tile_ranges else "")
+        + (f"_gqa{gqa_pack_size}" if gqa_pack_size > 1 else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -397,6 +403,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
             balanced_scheduler,
             enable_skip_softmax,
             with_kv_tile_ranges,
+            gqa_pack_size,
         ),
         extra_key_files=_cache_key_files(),
     )
