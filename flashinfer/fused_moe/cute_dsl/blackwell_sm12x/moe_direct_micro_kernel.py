@@ -653,6 +653,7 @@ class MoEDirectMicroKernel:
         *,
         max_active_ctas: int | None = None,
         device: torch.device | None = None,
+        one_round_fc1: bool = False,
     ):
         cfg = _make_shape_config(
             m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated
@@ -691,6 +692,24 @@ class MoEDirectMicroKernel:
             # avoiding a second input quantization and task barriers.
             # Whole N64 chunks retain four independent Q1 block writers.
             num_fc1_chunks = _fc1_chunks_for_m(4, n)
+        one_round_fc1 = bool(one_round_fc1 and not self.w4a16_mode and not self.a8_mx_mode
+                             and self.compile_time_phase == 0)
+        if one_round_fc1:
+            _fc2_tasks = cfg.k_dim // (_K_PER_CTA * 2) if m == 1 else (m * cfg.k_dim) // (_K_PER_CTA * 4)
+            def _balanced_grid(tasks):
+                cap = max(1, min(int(max_active_ctas), tasks))
+                rounds = -(-tasks // cap)
+                return max(1, -(-tasks // rounds))
+            def _valid(c):
+                return n % c == 0 and (n // c) % _BLOCK_SIZE == 0
+            num_fc1_chunks = max(1, n // (16 * _NUM_WARPS))
+            while num_fc1_chunks > 1 and not _valid(num_fc1_chunks):
+                num_fc1_chunks -= 1
+            _fc2_grid = _balanced_grid(_fc2_tasks)
+            for c in range(n // _BLOCK_SIZE, num_fc1_chunks, -1):
+                if _valid(c) and m * num_topk * c <= _fc2_grid:
+                    num_fc1_chunks = c
+                    break
         if self.w4a16_mode and m == 1 and n <= 2048:
             # 4 rows/warp only helps the k_segments==8 aligned gated path (its
             # reg-hoist + dual-dot assume 4 rows). The k_segments==12 path is
@@ -728,7 +747,9 @@ class MoEDirectMicroKernel:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
         else:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
-        if self.compile_time_phase == 1:
+        if one_round_fc1 and self.compile_time_phase == 0:
+            grid_x = max(_balanced_grid(fc2_tasks), min(fc1_tasks, int(max_active_ctas)))
+        elif self.compile_time_phase == 1:
             # A standalone FC1 phase has no cooperative-grid requirement.
             grid_x = max(1, fc1_tasks)
         elif self.compile_time_phase == 2:
@@ -5110,6 +5131,7 @@ def build_direct_micro_kernel(
     swiglu_beta: float | None = None,
     max_active_ctas: int | None = None,
     device: torch.device | None = None,
+    one_round_fc1: bool = False,
 ) -> MoEDirectMicroKernel:
     """Construct and configure a direct micro kernel for one problem shape.
 
@@ -5141,7 +5163,8 @@ def build_direct_micro_kernel(
         swiglu_beta=swiglu_beta,
     )
     kernel.configure(
-        m, k, n, num_topk, weight_E, max_active_ctas=max_active_ctas, device=device
+        m, k, n, num_topk, weight_E, max_active_ctas=max_active_ctas, device=device,
+        one_round_fc1=one_round_fc1,
     )
     return kernel
 

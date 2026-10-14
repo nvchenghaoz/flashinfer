@@ -105,7 +105,8 @@ _FORCED_BACKEND: str | None = None
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 # The retained NVFP4 path uses the 32x128 schedule through 1024 routed pairs.
 # MXFP4 keeps the generic 640-pair compact boundary.
-_STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT = 1024
+_STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT = 2048  # SWEEP SANDBOX (main: 1024)
+_SWEEP_ONE_ROUND_FC1 = False  # SWEEP SANDBOX
 # The static/dynamic crossover sits at a routed-row density (rows per weight
 # expert), so the NVFP4 band scales with E above the 1024-pair floor.  These
 # two densities are the legacy fallback for keys without a measured
@@ -2102,6 +2103,7 @@ def _get_direct_micro_kernel(
     topk_ids_dtype: torch.dtype = torch.int32,
     fast_math: bool = True,
     input_scales_are_reciprocal: bool = True,
+    one_round_fc1: bool = False,
     share_input_across_experts: bool = False,
     share_expert_scales: bool = False,
     activation: str = "silu",
@@ -2138,6 +2140,7 @@ def _get_direct_micro_kernel(
         swiglu_beta,
         swiglu_limit,
         str(_canonical_cuda_device(device)) if device is not None else None,
+        one_round_fc1,
     )
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
@@ -2159,6 +2162,7 @@ def _get_direct_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         device=device,
+        one_round_fc1=one_round_fc1,
     )
     compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
@@ -2350,6 +2354,7 @@ def launch_sm120_static_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             device=a.device,
+            one_round_fc1=_SWEEP_ONE_ROUND_FC1,
         )
         if not block_ok:
             if _FORCED_BACKEND == "direct_micro":
