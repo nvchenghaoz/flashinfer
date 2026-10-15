@@ -199,6 +199,85 @@ def ptx_mma_m16n8k32_f32(
 
 
 @cute.jit
+def ptx_mma_m16n8k16_f32(
+    a0: cutlass.Int32,
+    a1: cutlass.Int32,
+    a2: cutlass.Int32,
+    a3: cutlass.Int32,
+    b0: cutlass.Int32,
+    b1: cutlass.Int32,
+    c0: cutlass.Float32,
+    c1: cutlass.Float32,
+    c2: cutlass.Float32,
+    c3: cutlass.Float32,
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    """``mma.sync.aligned.m16n8k16.row.col.f32.{bf16,f16}.{bf16,f16}.f32``."""
+    if cutlass.const_expr(ab_dtype == cutlass.BFloat16):
+        instr = "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+    elif cutlass.const_expr(ab_dtype == cutlass.Float16):
+        instr = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+    else:
+        raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
+    return cute.arch.inline_ptx(
+        instr + " {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};",
+        write_only_types=[
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+        ],
+        read_only_args=[a0, a1, a2, a3, b0, b1, c0, c1, c2, c3],
+    )
+
+
+@cute.jit
+def ptx_mma_f32(
+    a0: cutlass.Int32,
+    a1: cutlass.Int32,
+    a2: cutlass.Int32,
+    a3: cutlass.Int32,
+    b0: cutlass.Int32,
+    b1: cutlass.Int32,
+    c0: cutlass.Float32,
+    c1: cutlass.Float32,
+    c2: cutlass.Float32,
+    c3: cutlass.Float32,
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    """One 32-byte-K warp MMA: m16n8k32 for FP8, m16n8k16 for 16-bit inputs.
+
+    Both shapes use identical A/B/C register layouts in bytes, so callers share
+    fragment loads and only the element count per register differs.
+    """
+    if cutlass.const_expr(ab_dtype == cutlass.Float8E4M3FN):
+        return ptx_mma_m16n8k32_f32(
+            a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, ab_dtype
+        )
+    return ptx_mma_m16n8k16_f32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, ab_dtype)
+
+
+@cute.jit
+def cvt_f32x2_to_16bitx2(
+    lo: cutlass.Float32,
+    hi: cutlass.Float32,
+    dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+) -> cutlass.Int32:
+    """Convert two FP32 values into one packed BF16x2/F16x2 MMA operand (``lo`` in bits 0-15)."""
+    if cutlass.const_expr(dtype == cutlass.BFloat16):
+        instr = "cvt.rn.bf16x2.f32 $0, $1, $2;"
+    elif cutlass.const_expr(dtype == cutlass.Float16):
+        instr = "cvt.rn.f16x2.f32 $0, $1, $2;"
+    else:
+        raise TypeError(f"Invalid 16-bit dtype: {dtype}")
+    return cute.arch.inline_ptx(
+        instr,
+        write_only_types=[cutlass.Int32],
+        read_only_args=[hi, lo],
+    )
+
+
+@cute.jit
 def get_swizzled_col(
     row: cutlass.Int32,
     col: cutlass.Int32,
@@ -328,7 +407,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     """Configure and launch the warp-specialized SM120 FP8 FMHA kernel."""
 
     SEQ_Q_TILES = [128, 64]
-    SEQ_KV_TILES = [128, 64]
+    SEQ_KV_TILES = [128, 64, 32]
     SUPPORTED_HEAD_TILES = [32, 64, 128, 256]
     SUPPORTED_PAGE_SIZES = SUPPORTED_PAGE_SIZES
     MMA_TILER = (16, 8, 32)  # mma.sync.aligned.m16n8k32
@@ -339,6 +418,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     # Barrier 0 is the CTA-wide initialization barrier; barrier 1 synchronizes
     # compute warps before the K/V storage is aliased for the output epilogue.
     COMPUTE_BARRIER_ID = 1
+    PINGPONG_BARRIER_BASE = 2
     # K and V operands share a three-slot circular TMA pipeline for the
     # Q128/KV128 fast paths. D128 and D256 use 48 KiB and 96 KiB respectively,
     # both within the SM120 shared-memory capacity.
@@ -374,10 +454,20 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             tile (row ``r`` is token ``r // gqa_pack_size``). Must divide ``q_tile``.
         """
         # Data types
-        if in_dtype != cutlass.Float8E4M3FN:
-            raise ValueError("in_dtype must be Float8E4M3FN")
+        if in_dtype not in (cutlass.Float8E4M3FN, cutlass.BFloat16, cutlass.Float16):
+            raise ValueError("in_dtype must be Float8E4M3FN, BFloat16, or Float16")
         if out_dtype not in (cutlass.Float16, cutlass.BFloat16):
             raise ValueError("out_dtype must be Float16 or BFloat16")
+        self.is_16bit = in_dtype != cutlass.Float8E4M3FN
+        if self.is_16bit:
+            # One MMA still covers 32 bytes of K; P needs no FP8 range pre-scale.
+            self.MMA_TILER = (16, 8, 16)
+            self.P_FP8_PRESCALE_LOG2 = 0.0
+            if q_tile == 128 and kv_tile == 128 and head_tile in (128, 256):
+                raise ValueError(
+                    "16-bit inputs use the generic path; the Q128/KV128 D128/D256 "
+                    "fast paths are FP8-only"
+                )
         self.in_dtype = in_dtype
         self.out_dtype = out_dtype
         self.is_causal = is_causal
@@ -401,8 +491,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             raise ValueError(f"gqa_pack_size must divide q_tile={q_tile}")
         self.gqa_pack_size = gqa_pack_size
         self.q_tile_tokens = q_tile // gqa_pack_size
+        # 16-bit inputs stream K/V through the three-slot operand ring too.
         self.kv_pipeline_stages = (
-            3 if head_tile in (128, 256) and q_tile == 128 and kv_tile == 128 else 2
+            3
+            if self.is_16bit
+            or (head_tile in (128, 256) and q_tile == 128 and kv_tile == 128)
+            else 2
         )
         if self.use_paged_kv:
             if num_tokens_per_page not in self.SUPPORTED_PAGE_SIZES:
@@ -438,6 +532,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             self.empty_warp_ids = (5, 6, 7)
             self.num_warps = 8
         self.num_compute_warps = len(self.compute_warp_ids)
+        # 16-bit Q128: two groups of four compute warps take turns on the
+        # tensor pipe (named barriers 2 and 3), so one group's softmax overlaps
+        # the other group's MMAs.
+        self.pingpong = False
         self.threads_per_cta = cute.arch.WARP_SIZE * self.num_warps
         self.threads_compute = cute.arch.WARP_SIZE * self.num_compute_warps
 
@@ -567,7 +665,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         """
         if len(q_shape) != 4 or len(k_shape) != 4:
             return False
-        if in_dtype != cutlass.Float8E4M3FN:
+        if in_dtype not in (cutlass.Float8E4M3FN, cutlass.BFloat16, cutlass.Float16):
+            return False
+        if (
+            in_dtype != cutlass.Float8E4M3FN
+            and q_tile == 128
+            and kv_tile == 128
+            and q_shape[3] in (128, 256)
+        ):
             return False
         if out_dtype not in (cutlass.Float16, cutlass.BFloat16):
             return False
@@ -768,8 +873,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :return: Packed Q fragments arranged for ``mma.sync`` A operands.
         """
 
-        # Each lane loads a contiguous 4-element vector. The shuffles below
-        # transpose the four row quads into the m16n8k32 A-fragment layout.
+        # Each lane loads a contiguous 4-byte vector (4 FP8 or 2 16-bit values).
+        # The shuffles below transpose the four row quads into the A-fragment
+        # layout, which is byte-identical for m16n8k32 FP8 and m16n8k16 16-bit.
+        elems_per_reg = 4 // self.in_dtype.bytes
+
         def load_q_fragment(col0_in_cta: cutlass.Int32):
             q_regs_per_frag = [
                 cutlass.Int32(0),
@@ -781,7 +889,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 row_in_cta = (
                     basic_params.q_warp_row0 + row_quad * 4 + basic_params.lane_div8
                 )
-                col_in_cta = col0_in_cta + basic_params.lane_mod8 * 4
+                col_in_cta = col0_in_cta + basic_params.lane_mod8 * elems_per_reg
                 cur_q_seq_idx = basic_params.q_seq_idx + self.q_row_token(row_in_cta)
                 q_head_col = col_in_cta + self.q_row_head_offset(
                     row_in_cta, basic_params.head_dim
@@ -813,7 +921,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             + basic_params.q_head_base
                             + cur_q_seq_idx * basic_params.q_seq_stride
                             + q_head_col
-                        ).load(count=4, alignment=4)
+                        ).load(count=elems_per_reg, alignment=4)
                         q_regs_per_frag[row_quad] = q_vec.bitcast(cutlass.Int32)[0]
             return q_regs_per_frag
 
@@ -990,7 +1098,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             tile_row_max[row_half] = -cutlass.Float32.inf
 
         k_row_in_frag_pair = (basic_params.lane_div8 // 2) * 8 + basic_params.lane_mod8
-        k_col_in_frag_pair = (basic_params.lane_div8 % 2) * 16
+        # ldmatrix rows are 16 bytes: 16 FP8 or 8 16-bit elements.
+        k_col_in_frag_pair = (basic_params.lane_div8 % 2) * (16 // self.in_dtype.bytes)
 
         def load_k_fragment_pair(
             d_offset: cutlass.Constexpr[int],
@@ -1024,7 +1133,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 for k_in_block in cutlass.range_constexpr(4):
                     k_frag = k_block * 4 + k_in_block
                     s_off = k_frag * 4
-                    s_regs[s_off:4] = ptx_mma_m16n8k32_f32(
+                    s_regs[s_off:4] = ptx_mma_f32(
                         q_regs[q_off + 0],
                         q_regs[q_off + 1],
                         q_regs[q_off + 2],
@@ -1345,11 +1454,19 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         uses_direct_p_pack = cutlass.const_expr(
             self.head_tile == 128 and self.q_tile == 128 and self.kv_tile == 128
         )
-        if cutlass.const_expr(self.is_causal and not uses_direct_p_pack):
+        v_initial = None
+        if cutlass.const_expr(self.is_16bit):
+            # Two 16-bit P values per register: S fragment k_frag, row half r
+            # maps directly onto the PV A operand (no lane exchange needed).
+            p_regs = cutlass.Array(cutlass.Int32, self.qk_k_frags * 2, alignment=16)
+        elif cutlass.const_expr(self.is_causal and not uses_direct_p_pack):
             p_regs = cutlass.Array(cutlass.Uint16, self.qk_k_frags * 2, alignment=16)
         else:
             p_regs = cutlass.Array(cutlass.Int32, self.qk_k_frags, alignment=16)
-        v_initial = cutlass.Array(cutlass.Int32, self.pv_d_frags * 2, alignment=16)
+        if cutlass.const_expr(not self.is_16bit):
+            v_initial = cutlass.Array(
+                cutlass.Int32, self.pv_d_frags * 2, alignment=16
+            )
 
         for row_half in cutlass.range_constexpr(2):
             s_reg_idx_lo = row_half * 2
@@ -1457,7 +1574,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 p1 = cute.math.exp2(in1, fastmath=True)
                 tile_sum0 = tile_sum0 + p0
                 tile_sum1 = tile_sum1 + p1
-                if cutlass.const_expr(self.is_causal and not uses_direct_p_pack):
+                if cutlass.const_expr(self.is_16bit):
+                    p_regs[k_frag * 2 + row_half] = cvt_f32x2_to_16bitx2(
+                        p0, p1, self.in_dtype
+                    )
+                elif cutlass.const_expr(self.is_causal and not uses_direct_p_pack):
                     p_regs[k_frag * 2 + row_half] = cvt_f32x2_to_f8x2(
                         p1, p0, self.in_dtype
                     )
@@ -1476,7 +1597,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             else:
                 row_sum[row_half] = row_sum[row_half] * old_scale + tile_sum
 
-            if cutlass.const_expr(row_half == 0):
+            if cutlass.const_expr(row_half == 0 and not self.is_16bit):
                 # Scores for this row half are dead. Load the first V fragment
                 # set into that register window while row-half 1 still has
                 # scalar softmax work available to hide the shared-memory load.
@@ -1859,6 +1980,85 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             v_cur = v_next
 
     @cute.jit
+    def mma_pv_16bit(
+        self,
+        basic_params: SimpleNamespace,
+        mma_params: SimpleNamespace,
+        sV: cutlass.Pointer,
+        p_regs: cutlass.Array,
+    ) -> None:
+        """``O += P @ V`` for 16-bit inputs.
+
+        The m16n8k16 A operand for K/V rows ``16j..16j+15`` is the softmax
+        output of S fragments ``2j`` (registers a0/a1) and ``2j+1`` (a2/a3).
+        V fragments are loaded just in time with a transposing x4 ldmatrix:
+        lanes 0-15 address K/V rows ``16j + lane % 16`` and lanes 16-31 the next
+        eight head columns, giving (b0, b1) for two adjacent 8-column D blocks.
+        """
+        o_regs = mma_params.o_regs
+        v_row_in_frag = basic_params.lane % 16
+        v_col_in_pair = (basic_params.lane // 16) * 8
+
+        def load_v_pair(v_frag: cutlass.Constexpr[int], d_pair: cutlass.Constexpr[int]):
+            v_row = v_frag * self.MMA_TILER[2] + v_row_in_frag
+            v_col = d_pair * 16 + v_col_in_pair
+            v_chunk = v_col // self.tma_copy_head_per_iter
+            v_col_in_chunk = v_col % self.tma_copy_head_per_iter
+            sV_ptr = (
+                sV
+                + v_chunk * self.tma_copy_elems_per_iter
+                + v_row * self.tma_copy_head_per_iter
+                + self._get_swizzled_col(v_row, v_col_in_chunk)
+            )
+            return prims.ldmatrix(sV_ptr, 4, prims.MMALayout.COL)
+
+        for v_frag in cutlass.range_constexpr(self.pv_v_frags):
+            a0 = p_regs[(2 * v_frag) * 2 + 0]
+            a1 = p_regs[(2 * v_frag) * 2 + 1]
+            a2 = p_regs[(2 * v_frag + 1) * 2 + 0]
+            a3 = p_regs[(2 * v_frag + 1) * 2 + 1]
+            v_cur = load_v_pair(v_frag, 0)
+            for d_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
+                if cutlass.const_expr(d_pair + 1 < self.pv_d_frags // 2):
+                    v_next = load_v_pair(v_frag, d_pair + 1)
+                for d_in_pair in cutlass.range_constexpr(2):
+                    d_frag = d_pair * 2 + d_in_pair
+                    o_off = d_frag * 4
+                    o_regs[o_off:4] = ptx_mma_f32(
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        v_cur[d_in_pair * 2 + 0],
+                        v_cur[d_in_pair * 2 + 1],
+                        o_regs[o_off + 0],
+                        o_regs[o_off + 1],
+                        o_regs[o_off + 2],
+                        o_regs[o_off + 3],
+                        self.in_dtype,
+                    )
+                if cutlass.const_expr(d_pair + 1 < self.pv_d_frags // 2):
+                    v_cur = v_next
+
+    @cute.jit
+    def pingpong_acquire(self, basic_params: SimpleNamespace) -> None:
+        """Wait for this warp group's turn on the tensor pipe."""
+        if cutlass.const_expr(self.pingpong):
+            prims.barrier_cta_sync(
+                self.PINGPONG_BARRIER_BASE + basic_params.pp_group,
+                thread_count=self.threads_compute,
+            )
+
+    @cute.jit
+    def pingpong_release(self, basic_params: SimpleNamespace) -> None:
+        """Hand the tensor pipe to the other warp group."""
+        if cutlass.const_expr(self.pingpong):
+            prims.barrier_cta_arrive(
+                self.PINGPONG_BARRIER_BASE + 1 - basic_params.pp_group,
+                self.threads_compute,
+            )
+
+    @cute.jit
     def wait_pipeline_barrier(
         self,
         mbar: cutlass.Pointer,
@@ -2151,12 +2351,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             and not uses_softmax_init_path
             and not is_masked_frontier_tile
         )
+        self.pingpong_acquire(basic_params)
         s_regs, tile_row_max = self.mma_qk_single_buffer(
             basic_params,
             q_regs,
             sK,
             tracks_tile_row_max,
         )
+        self.pingpong_release(basic_params)
         if prims.elect_sync():
             prims.mbarrier_arrive(
                 k_consumed,
@@ -2218,13 +2420,18 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 uses_softmax_init_path,
                 tracks_tile_row_max,
             )
-            self.mma_pv_single_buffer_preloaded(
-                basic_params,
-                mma_params,
-                sV,
-                p_regs,
-                v_initial,
-            )
+            if cutlass.const_expr(self.is_16bit):
+                self.pingpong_acquire(basic_params)
+                self.mma_pv_16bit(basic_params, mma_params, sV, p_regs)
+                self.pingpong_release(basic_params)
+            else:
+                self.mma_pv_single_buffer_preloaded(
+                    basic_params,
+                    mma_params,
+                    sV,
+                    p_regs,
+                    v_initial,
+                )
         if prims.elect_sync():
             prims.mbarrier_arrive(
                 v_consumed,
@@ -2422,7 +2629,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
 
             uses_three_stage_pipeline = cutlass.const_expr(
-                self.head_tile in (128, 256)
+                self.is_16bit
+                or self.head_tile in (128, 256)
                 and self.q_tile == 128
                 and self.kv_tile == 128
             )
@@ -2647,7 +2855,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
             )
             uses_direct_state_ring = cutlass.const_expr(
-                self.head_tile == 128 and self.q_tile == 128 and self.kv_tile == 128
+                self.is_16bit
+                or self.head_tile == 128
+                and self.q_tile == 128
+                and self.kv_tile == 128
             )
             uses_unified_kv_ring = cutlass.const_expr(
                 uses_distributed_row_state or uses_direct_state_ring
@@ -2696,6 +2907,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 lane_mod4=lane_mod4,
                 lane_div8=lane_div8,
                 lane_mod8=lane_mod8,
+                pp_group=compute_warp_idx // 4,
                 # Unified K/V ring arrival and reuse handshakes.
                 mbar_arrived=mbar_arrived,
                 mbar_consumed=mbar_consumed,
@@ -2733,6 +2945,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
             # Load Q into registers.
             q_regs = self.load_q_tile(basic_params)
+            if cutlass.const_expr(self.pingpong):
+                # Group 0 takes the first turn.
+                if basic_params.pp_group == 1:
+                    prims.barrier_cta_arrive(
+                        self.PINGPONG_BARRIER_BASE, self.threads_compute
+                    )
 
             # K/V runs right-to-left, so tail/causal boundary tiles form a short
             # masked prefix. Once that prefix is consumed, every remaining tile
