@@ -18,7 +18,7 @@ from .custom_compile_cache import (
 from .collective_inverse_hmma import CollectiveInverse
 from .helpers import SM80, round_down, state_dtype_to_cutlass
 from .schedule import WorkDesc
-from .varlen_helper import is_integer_dtype
+from .varlen_helper import choose_v_split_host, is_integer_dtype
 
 
 @functools.cache
@@ -34,6 +34,10 @@ class NamedBarrier(IntEnum):
     MATH_WG0 = 4  # OrderedMathBarriers: StreamkBarrier0
     MATH_WG1 = 5  # OrderedMathBarriers: StreamkBarrier1
     KK_SYNC = 13  # sync all 128 WG0 threads before collective_inverse
+    # V-split mode: WG0 publishes T and QK to the V-row warps (FULL) and waits
+    # until they have read the previous chunk's copies (EMPTY).
+    SPLIT_FULL = 6
+    SPLIT_EMPTY = 7
 
 
 class WarpGroupRole(IntEnum):
@@ -55,8 +59,13 @@ class MathWarpGroupRole(IntEnum):
 
 
 # ─── Warp-specialized delta-rule kernel ───────────────────────────────────────
-# Grid: (num_seqs * num_sab_heads, 1, 1)
+# Grid: (num_seqs * num_sab_heads * v_split, 1, 1)
 # Block: 384 threads → WG0=[0,127], WG1=[128,255], WG2=[256,383]
+#
+# v_split > 1 splits the V rows of each head's state across v_split CTAs
+# (state rows evolve independently). Each CTA then owns D // v_split rows:
+# math WG0 computes KK^T, its inverse T and QK^T (full, V-independent), and the
+# first (D // v_split) // 16 warps of math WG1 run the V-row GEMMs on their rows.
 #
 # needs_alpha / needs_beta / needs_init_state are class attributes set in __init__.
 # The JIT compiler specialises per instance, so they are compile-time booleans
@@ -131,6 +140,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         checkpoint_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         use_state_indices: bool = False,
+        v_split: int = 1,
         cu_seqlens_dtype: torch.dtype = torch.int64,
         state_indices_dtype: torch.dtype | None = None,
         checkpoint_cu_starts_dtype: torch.dtype | None = None,
@@ -156,6 +166,10 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         self.BLK_Q = 64
         self.BLK_KV = 64
         self.D = 128
+        assert v_split in (1, 2, 4, 8), f"v_split must be 1, 2, 4 or 8, got {v_split}"
+        self.v_split = v_split
+        self.Dv = self.D // v_split
+        self.num_v_warps = self.Dv // 16
         self.q_stage = 1
         self.k_stage = 2
         self.v_stage = 1
@@ -172,6 +186,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             "state_dtype",
             "checkpoint_state_dtype",
             "use_state_indices",
+            "v_split",
             "cu_seqlens_dtype",
             "state_indices_dtype",
             "checkpoint_cu_starts_dtype",
@@ -196,6 +211,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         num_sab_heads: cutlass.Int32,
     ) -> WorkDesc:
         bx, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.v_split > 1):
+            bx = bx // cutlass.Int32(self.v_split)
         seq_idx = bx // num_sab_heads
         o_head_idx = bx % num_sab_heads
         q_head_idx = o_head_idx * num_q_heads // num_sab_heads
@@ -663,12 +680,20 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tKVrKV: cute.Tensor,
         gKV: cute.Tensor,
         kv_thr_mma,
+        v_off=None,
     ):
-        c_kv = cute.make_identity_tensor((self.D, self.D))
-        tKVcKV = kv_thr_mma.partition_C(c_kv)
-        for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
-            v_idx, k_idx = tKVcKV[i]
-            tKVrKV[i] = gKV[k_idx, v_idx].to(self.acc_dtype)
+        if cutlass.const_expr(v_off is None):
+            c_kv = cute.make_identity_tensor((self.D, self.D))
+            tKVcKV = kv_thr_mma.partition_C(c_kv)
+            for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
+                v_idx, k_idx = tKVcKV[i]
+                tKVrKV[i] = gKV[k_idx, v_idx].to(self.acc_dtype)
+        else:
+            c_kv = cute.make_identity_tensor((self.Dv, self.D))
+            tKVcKV = kv_thr_mma.partition_C(c_kv)
+            for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
+                v_idx, k_idx = tKVcKV[i]
+                tKVrKV[i] = gKV[k_idx, v_off + v_idx].to(self.acc_dtype)
 
     @cute.jit
     def kv_store(
@@ -676,12 +701,20 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tKVrKV: cute.Tensor,
         gKV: cute.Tensor,
         kv_thr_mma,
+        v_off=None,
     ):
-        c_kv = cute.make_identity_tensor((self.D, self.D))
-        tKVcKV = kv_thr_mma.partition_C(c_kv)
-        for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
-            v_idx, k_idx = tKVcKV[i]
-            gKV[k_idx, v_idx] = tKVrKV[i].to(gKV.element_type)
+        if cutlass.const_expr(v_off is None):
+            c_kv = cute.make_identity_tensor((self.D, self.D))
+            tKVcKV = kv_thr_mma.partition_C(c_kv)
+            for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
+                v_idx, k_idx = tKVcKV[i]
+                gKV[k_idx, v_idx] = tKVrKV[i].to(gKV.element_type)
+        else:
+            c_kv = cute.make_identity_tensor((self.Dv, self.D))
+            tKVcKV = kv_thr_mma.partition_C(c_kv)
+            for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
+                v_idx, k_idx = tKVcKV[i]
+                gKV[k_idx, v_off + v_idx] = tKVrKV[i].to(gKV.element_type)
 
     @cute.jit
     def maybe_store_checkpoint(
@@ -697,6 +730,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         total_checkpoints: cutlass.Int32,
         block_end: cutlass.Int32,
         seq_len: cutlass.Int32,
+        v_off=None,
     ):
         if cutlass.const_expr(self.needs_checkpointing):
             if (
@@ -716,7 +750,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                     g_state_checkpoints.iterator, checkpoint_layout
                 )
                 gCheckpointKV = mCheckpoint[None, None, o_head_idx, checkpoint_idx]
-                self.kv_store(tKVrKV, gCheckpointKV, kv_thr_mma)
+                self.kv_store(tKVrKV, gCheckpointKV, kv_thr_mma, v_off)
 
     # ─── compute_loop_body ───────────────────────────────────────────────────
     # Translates the C++ compute_loop_body lambda captured inside compute().
@@ -1069,6 +1103,748 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             alpha_consumer_state,
             beta_consumer_state,
         )
+
+    # ─── V-split mode (v_split > 1) ──────────────────────────────────────────
+    # WG0 computes KK^T -> T (inverse) and QK^T for each chunk and publishes them
+    # in smem (SPLIT_FULL); the V-row warps of WG1 own Dv = D // v_split state
+    # rows and run O1/SK/NewV/O2/KV on them, then release T/QK (SPLIT_EMPTY).
+    # Per-element math is identical to the v_split == 1 path.
+
+    def _split_barrier_threads(self) -> int:
+        return 128 + 32 * self.num_v_warps
+
+    @cute.jit
+    def split_kk_qk_body(
+        self,
+        sQ_SD: cute.Tensor,
+        sK_SD: cute.Tensor,
+        sQK: cute.Tensor,
+        sKK_inv: cute.Tensor,
+        sKK_opd: cute.Tensor,
+        sAlpha: cute.Tensor,
+        sBeta: cute.Tensor,
+        q_pipeline,
+        q_consumer_state,
+        k_pipeline,
+        k_consumer_state,
+        alpha_pipeline,
+        alpha_consumer_state,
+        beta_pipeline,
+        beta_consumer_state,
+        is_final_block: bool,
+        B: cutlass.Int32,
+        scale: cutlass.Float32,
+        wg_tidx: cutlass.Int32,
+    ):
+        tile_shape_qk = (self.BLK_Q, self.BLK_KV, self.D)
+        k_stage = k_consumer_state.index
+        q_stage = q_consumer_state.index
+        alpha_stage = alpha_consumer_state.index
+        beta_stage = beta_consumer_state.index
+
+        mma_atom_4w = warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16))
+        qk_tiled_mma = cute.make_tiled_mma(
+            mma_atom_4w, cute.make_layout((4, 1, 1)), permutation_mnk=tile_shape_qk
+        )
+        kk_tiled_mma = cute.make_tiled_mma(
+            mma_atom_4w, cute.make_layout((4, 1, 1)), permutation_mnk=tile_shape_qk
+        )
+        qk_thr_mma = qk_tiled_mma.get_slice(wg_tidx)
+        kk_thr_mma = kk_tiled_mma.get_slice(wg_tidx)
+        ldsm_n4 = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
+        )
+        sQ_k = sQ_SD[None, None, q_stage]
+        sK_SD_k = sK_SD[None, None, k_stage]
+
+        qk_tiled_copy_A = cute.make_tiled_copy_A(ldsm_n4, qk_tiled_mma)
+        qk_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, qk_tiled_mma)
+        qk_thr_copy_A = qk_tiled_copy_A.get_slice(wg_tidx)
+        qk_thr_copy_B = qk_tiled_copy_B.get_slice(wg_tidx)
+        tQKrQ = qk_thr_mma.make_fragment_A(qk_thr_mma.partition_A(sQ_k))
+        tQKrQ_cv = qk_thr_copy_A.retile(tQKrQ)
+        tQKsQ = qk_thr_copy_A.partition_S(sQ_SD)
+        tQKrK = qk_thr_mma.make_fragment_B(qk_thr_mma.partition_B(sK_SD_k))
+        tQKrK_cv = qk_thr_copy_B.retile(tQKrK)
+        tQKsK = qk_thr_copy_B.partition_S(sK_SD)
+
+        kk_tiled_copy_A = cute.make_tiled_copy_A(ldsm_n4, kk_tiled_mma)
+        kk_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, kk_tiled_mma)
+        kk_thr_copy_A = kk_tiled_copy_A.get_slice(wg_tidx)
+        kk_thr_copy_B = kk_tiled_copy_B.get_slice(wg_tidx)
+        tKKrA = kk_thr_mma.make_fragment_A(kk_thr_mma.partition_A(sK_SD_k))
+        tKKrA_cv = kk_thr_copy_A.retile(tKKrA)
+        tKKsA = kk_thr_copy_A.partition_S(sK_SD)
+        tKKrB = kk_thr_mma.make_fragment_B(kk_thr_mma.partition_B(sK_SD_k))
+        tKKrB_cv = kk_thr_copy_B.retile(tKKrB)
+        tKKsB = kk_thr_copy_B.partition_S(sK_SD)
+
+        cMqk = cute.make_identity_tensor((self.BLK_Q, self.BLK_KV))
+        tQKcMqk = qk_thr_mma.partition_C(cMqk)
+        tKKcMkk = kk_thr_mma.partition_C(cMqk)
+
+        # ── KK^T ──
+        k_pipeline.consumer_wait(k_consumer_state)
+        if cutlass.const_expr(self.needs_alpha):
+            alpha_pipeline.consumer_wait(alpha_consumer_state)
+            cute.arch.fence_view_async_shared()
+        if cutlass.const_expr(self.needs_beta):
+            beta_pipeline.consumer_wait(beta_consumer_state)
+            cute.arch.fence_view_async_shared()
+        cute.copy(kk_tiled_copy_A, tKKsA[None, None, None, k_stage], tKKrA_cv)
+        cute.copy(kk_tiled_copy_B, tKKsB[None, None, None, k_stage], tKKrB_cv)
+        tKKrKK = cute.make_rmem_tensor(
+            kk_thr_mma.partition_shape_C((self.BLK_KV, self.BLK_KV)), self.acc_dtype
+        )
+        tKKrKK.fill(self.acc_dtype(0.0))
+        cute.gemm(kk_tiled_mma, tKKrKK, tKKrA, tKKrB, tKKrKK)
+        self.kk_epi(tKKrKK, tKKcMkk, sAlpha, sBeta, alpha_stage, beta_stage)
+        self.qk_or_kk_mask(tKKrKK, tKKcMkk, is_final_block, B)
+
+        # ── QK^T ──
+        q_pipeline.consumer_wait(q_consumer_state)
+        cute.copy(qk_tiled_copy_A, tQKsQ[None, None, None, q_stage], tQKrQ_cv)
+        cute.copy(qk_tiled_copy_B, tQKsK[None, None, None, k_stage], tQKrK_cv)
+        tQKrQK = cute.make_rmem_tensor(
+            qk_thr_mma.partition_shape_C((self.BLK_Q, self.BLK_KV)), self.acc_dtype
+        )
+        tQKrQK.fill(self.acc_dtype(0.0))
+        cute.gemm(qk_tiled_mma, tQKrQK, tQKrQ, tQKrK, tQKrQK)
+        q_pipeline.consumer_release(q_consumer_state)
+        q_consumer_state.advance()
+        self.qk_epi(tQKrQK, tQKcMqk, sAlpha, alpha_stage, scale)
+        self.qk_or_kk_mask(tQKrQK, tQKcMqk, is_final_block, B)
+
+        # ── Publish T and QK once the V-row warps released the previous chunk ──
+        cute.arch.barrier(
+            barrier_id=NamedBarrier.SPLIT_EMPTY,
+            number_of_threads=self._split_barrier_threads(),
+        )
+        self._kk_store_and_inv(
+            tKKrKK,
+            kk_tiled_mma,
+            wg_tidx,
+            sKK_inv,
+            sKK_opd,
+            sBeta,
+            beta_stage,
+            tKKcMkk,
+        )
+        self.qk_store(tQKrQK, sQK, qk_tiled_mma, wg_tidx)
+        cute.arch.barrier_arrive(
+            barrier_id=NamedBarrier.SPLIT_FULL,
+            number_of_threads=self._split_barrier_threads(),
+        )
+        if cutlass.const_expr(self.needs_beta):
+            beta_pipeline.consumer_release(beta_consumer_state)
+            beta_consumer_state.advance()
+        k_pipeline.consumer_release(k_consumer_state)
+        k_consumer_state.advance()
+        if cutlass.const_expr(self.needs_alpha):
+            alpha_pipeline.consumer_release(alpha_consumer_state)
+            alpha_consumer_state.advance()
+        return (
+            q_consumer_state,
+            k_consumer_state,
+            alpha_consumer_state,
+            beta_consumer_state,
+        )
+
+    @cute.jit
+    def split_v_body(
+        self,
+        sQ_SD: cute.Tensor,
+        sK_SD: cute.Tensor,
+        sK_DS: cute.Tensor,
+        sV_DS: cute.Tensor,  # (Dv, BlkKV, StagesV) slice of this CTA's V rows
+        sQK: cute.Tensor,
+        sKK_opd: cute.Tensor,
+        sO: cute.Tensor,
+        sAlpha: cute.Tensor,
+        kv_tiled_mma,
+        q_pipeline,
+        q_consumer_state,
+        k_pipeline,
+        k_consumer_state,
+        v_pipeline,
+        v_consumer_state,
+        o_pipeline,
+        o_producer_state,
+        alpha_pipeline,
+        alpha_consumer_state,
+        is_first_block: bool,
+        is_final_block: bool,
+        B: cutlass.Int32,
+        tKVrKV: cute.Tensor,
+        scale: cutlass.Float32,
+        v_tidx: cutlass.Int32,
+    ):
+        blk_q = self.BLK_Q
+        blk_kv = self.BLK_KV
+        d = self.D
+        dv = self.Dv
+        tile_shape_o1 = (dv, blk_q, d)
+        tile_shape_o2 = (dv, blk_q, blk_kv)
+        tile_shape_sk = (dv, blk_kv, d)
+        tile_shape_newv = (dv, blk_kv, blk_kv)
+        k_stage = k_consumer_state.index
+        q_stage = q_consumer_state.index
+        v_stage = v_consumer_state.index
+        o_stage = cutlass.Int32(0)
+        alpha_stage = alpha_consumer_state.index
+
+        mma_atom = warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16))
+        warp_layout = cute.make_layout((self.num_v_warps, 1, 1))
+        o1_tiled_mma = cute.make_tiled_mma(
+            mma_atom, warp_layout, permutation_mnk=tile_shape_o1
+        )
+        o2_tiled_mma = cute.make_tiled_mma(
+            mma_atom, warp_layout, permutation_mnk=tile_shape_o2
+        )
+        sk_tiled_mma = cute.make_tiled_mma(
+            mma_atom, warp_layout, permutation_mnk=tile_shape_sk
+        )
+        newv_tiled_mma = cute.make_tiled_mma(
+            mma_atom, warp_layout, permutation_mnk=tile_shape_newv
+        )
+        sk_thr_mma = sk_tiled_mma.get_slice(v_tidx)
+        newv_thr_mma = newv_tiled_mma.get_slice(v_tidx)
+        o1_thr_mma = o1_tiled_mma.get_slice(v_tidx)
+        o2_thr_mma = o2_tiled_mma.get_slice(v_tidx)
+        kv_thr_mma = kv_tiled_mma.get_slice(v_tidx)
+
+        ldsm_n4 = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
+        )
+        ldsm_t4 = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
+        )
+        sK_DS_k = sK_DS[None, None, k_stage]
+
+        sk_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, sk_tiled_mma)
+        sk_tiled_copy_C = cute.make_tiled_copy_C(ldsm_t4, sk_tiled_mma)
+        sk_thr_copy_B = sk_tiled_copy_B.get_slice(v_tidx)
+        sk_thr_copy_C = sk_tiled_copy_C.get_slice(v_tidx)
+        tSKrK = cute.make_rmem_tensor(
+            sk_thr_mma.partition_shape_B(cute.slice_(tile_shape_sk, (0, None, None))),
+            self.dtype,
+        )
+        tSKrK_cv = sk_thr_copy_B.retile(tSKrK)
+        tSKsK = sk_thr_copy_B.partition_S(sK_SD)
+
+        newv_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, newv_tiled_mma)
+        newv_thr_copy_B = newv_tiled_copy_B.get_slice(v_tidx)
+        tNewVrB = newv_thr_mma.make_fragment_B(newv_thr_mma.partition_B(sKK_opd))
+        tNewVrB_cv = newv_thr_copy_B.retile(tNewVrB)
+        tNewVsB = newv_thr_copy_B.partition_S(sKK_opd)
+
+        kv_tiled_copy_B = cute.make_tiled_copy_B(ldsm_t4, kv_tiled_mma)
+        kv_thr_copy_B = kv_tiled_copy_B.get_slice(v_tidx)
+        tKVrK = kv_thr_mma.make_fragment_B(kv_thr_mma.partition_B(sK_DS_k))
+        tKVrK_cv = kv_thr_copy_B.retile(tKVrK)
+        tKVsK = kv_thr_copy_B.partition_S(sK_DS)
+
+        o1_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, o1_tiled_mma)
+        o2_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, o2_tiled_mma)
+        o1_thr_copy_B = o1_tiled_copy_B.get_slice(v_tidx)
+        o2_thr_copy_B = o2_tiled_copy_B.get_slice(v_tidx)
+        tOrQ = cute.make_rmem_tensor(
+            o1_thr_mma.partition_shape_B(cute.slice_(tile_shape_o1, (0, None, None))),
+            self.dtype,
+        )
+        tOrQ_cv = o1_thr_copy_B.retile(tOrQ)
+        tOsQ = o1_thr_copy_B.partition_S(sQ_SD)
+        tOrQK = o2_thr_mma.make_fragment_B(o2_thr_mma.partition_B(sQK))
+        tOrQK_cv = o2_thr_copy_B.retile(tOrQK)
+        tOsQK = o2_thr_copy_B.partition_S(sQK)
+
+        o_stsm = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
+        )
+        o_tiled_copy_r2s = cute.make_tiled_copy_C(o_stsm, o1_tiled_mma)
+        o_thr_copy_r2s = o_tiled_copy_r2s.get_slice(v_tidx)
+        tOsO = o_thr_copy_r2s.partition_D(sO)
+
+        cO = cute.make_identity_tensor((dv, blk_q))
+        tOcO = o1_thr_mma.partition_C(cO)
+        cSK = cute.make_identity_tensor((dv, blk_kv))
+        tSKcSK = sk_thr_mma.partition_C(cSK)
+        tKVcV = kv_thr_mma.partition_A(cSK)
+
+        k_pipeline.consumer_wait(k_consumer_state)
+        if cutlass.const_expr(self.needs_alpha):
+            alpha_pipeline.consumer_wait(alpha_consumer_state)
+            cute.arch.fence_view_async_shared()
+
+        # ── O1: KV_state @ Q ──
+        q_pipeline.consumer_wait(q_consumer_state)
+        tOrO = cute.make_rmem_tensor(
+            o1_thr_mma.partition_shape_C((dv, blk_q)), self.acc_dtype
+        )
+        tOrO.fill(self.acc_dtype(0.0))
+        if cutlass.const_expr(not is_first_block):
+            cute.copy(o1_tiled_copy_B, tOsQ[None, None, None, q_stage], tOrQ_cv)
+            tOrKV = SM80.make_acc_into_op(tKVrKV, o1_tiled_mma, self.dtype)
+            cute.gemm(o1_tiled_mma, tOrO, tOrKV, tOrQ, tOrO)
+            self.o1_epi(tOrO, tOcO, sAlpha, alpha_stage, scale)
+        q_pipeline.consumer_release(q_consumer_state)
+        q_consumer_state.advance()
+
+        # ── SK: KV_state @ K^T ──
+        tSKrSK = cute.make_rmem_tensor(
+            sk_thr_mma.partition_shape_C((dv, blk_kv)), self.acc_dtype
+        )
+        tSKrSK.fill(self.acc_dtype(0.0))
+        if cutlass.const_expr(not is_first_block):
+            tSKrS = SM80.make_acc_into_op(tKVrKV, sk_tiled_mma, self.dtype)
+            cute.copy(sk_tiled_copy_B, tSKsK[None, None, None, k_stage], tSKrK_cv)
+            cute.gemm(sk_tiled_mma, tSKrSK, tSKrS, tSKrK, tSKrSK)
+
+        v_pipeline.consumer_wait(v_consumer_state)
+        tSKrV = self.sk_load_v(tSKrSK, sV_DS, sk_tiled_copy_C, sk_thr_copy_C, v_stage)
+        if cutlass.const_expr(not is_first_block):
+            self.sk_epi(tSKrSK, tSKcSK, sAlpha, alpha_stage)
+            for i in cutlass.range_constexpr(cute.size(tSKrV)):
+                tSKrV[i] = tSKrV[i] - self.dtype(tSKrSK[i])
+        v_pipeline.consumer_release(v_consumer_state)
+        v_consumer_state.advance()
+
+        # ── NewV = (V - SK) @ T^T ──
+        tNewVrA = SM80.make_acc_into_op(tSKrV, newv_tiled_mma, self.dtype)
+        tNewVrC = cute.make_rmem_tensor(
+            newv_thr_mma.partition_shape_C((dv, blk_kv)), self.acc_dtype
+        )
+        cute.arch.barrier(
+            barrier_id=NamedBarrier.SPLIT_FULL,
+            number_of_threads=self._split_barrier_threads(),
+        )
+        cute.copy(newv_tiled_copy_B, tNewVsB, tNewVrB_cv)
+        tNewVrC.fill(self.acc_dtype(0.0))
+        cute.gemm(newv_tiled_mma, tNewVrC, tNewVrA, tNewVrB, tNewVrC)
+
+        # ── O2 = O1 + NewV @ QK ──
+        tOrNewV = SM80.make_acc_into_op(tNewVrC, o2_tiled_mma, self.dtype)
+        cute.copy(o2_tiled_copy_B, tOsQK, tOrQK_cv)
+        cute.arch.barrier_arrive(
+            barrier_id=NamedBarrier.SPLIT_EMPTY,
+            number_of_threads=self._split_barrier_threads(),
+        )
+        cute.gemm(o2_tiled_mma, tOrO, tOrNewV, tOrQK, tOrO)
+
+        o_pipeline.producer_acquire(o_producer_state)
+        self.o_store(
+            tOrO,
+            tOsO[None, None, None, o_stage],
+            o_tiled_copy_r2s,
+            o_thr_copy_r2s,
+        )
+        o_pipeline.producer_commit(o_producer_state)
+        o_producer_state.advance()
+
+        # ── KV state update ──
+        block_coeff = cutlass.Float32(1.0)
+        if cutlass.const_expr(self.needs_alpha):
+            block_coeff = cutlass.Float32(
+                sAlpha[B - cutlass.Int32(1), AlphaProcessor.CUMPROD, alpha_stage]
+            )
+        for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
+            tKVrKV[i] = block_coeff * tKVrKV[i]
+        self.kv_decay_v(tOrNewV, tKVcV, sAlpha, alpha_stage, is_final_block, B)
+        cute.copy(kv_tiled_copy_B, tKVsK[None, None, None, k_stage], tKVrK_cv)
+        cute.gemm(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, tKVrKV)
+        k_pipeline.consumer_release(k_consumer_state)
+        k_consumer_state.advance()
+        if cutlass.const_expr(self.needs_alpha):
+            alpha_pipeline.consumer_release(alpha_consumer_state)
+            alpha_consumer_state.advance()
+        return (
+            q_consumer_state,
+            k_consumer_state,
+            v_consumer_state,
+            o_producer_state,
+            alpha_consumer_state,
+        )
+
+    @cute.jit
+    def run_split_kk_role(
+        self,
+        sQ_SD: cute.Tensor,
+        sK_SD: cute.Tensor,
+        sQK: cute.Tensor,
+        sKK_inv: cute.Tensor,
+        sKK_opd: cute.Tensor,
+        sAlpha: cute.Tensor,
+        sBeta: cute.Tensor,
+        q_pipeline,
+        k_pipeline,
+        alpha_pipeline,
+        beta_pipeline,
+        work_desc: WorkDesc,
+        scale: cutlass.Float32,
+        math_tidx: cutlass.Int32,
+        num_blocks: cutlass.Int32,
+    ):
+        q_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.q_stage
+        )
+        k_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.k_stage
+        )
+        alpha_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage
+        )
+        first_B = work_desc.seq_len
+        if first_B > cutlass.Int32(self.BLK_KV):
+            first_B = cutlass.Int32(self.BLK_KV)
+
+        beta_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage
+        )
+        # First and last blocks mask with their valid token count (as in
+        # run_math_role); middle blocks are full.
+        (
+            q_consumer_state,
+            k_consumer_state,
+            alpha_consumer_state,
+            beta_consumer_state,
+        ) = self.split_kk_qk_body(
+            sQ_SD,
+            sK_SD,
+            sQK,
+            sKK_inv,
+            sKK_opd,
+            sAlpha,
+            sBeta,
+            q_pipeline,
+            q_consumer_state,
+            k_pipeline,
+            k_consumer_state,
+            alpha_pipeline,
+            alpha_consumer_state,
+            beta_pipeline,
+            beta_consumer_state,
+            True,
+            first_B,
+            scale,
+            math_tidx,
+        )
+        for blk in cutlass.range(
+            cutlass.Int32(1),
+            num_blocks - cutlass.Int32(1),
+            cutlass.Int32(1),
+            unroll=1,
+        ):
+            (
+                q_consumer_state,
+                k_consumer_state,
+                alpha_consumer_state,
+                beta_consumer_state,
+            ) = self.split_kk_qk_body(
+                sQ_SD,
+                sK_SD,
+                sQK,
+                sKK_inv,
+                sKK_opd,
+                sAlpha,
+                sBeta,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                beta_pipeline,
+                beta_consumer_state,
+                False,
+                cutlass.Int32(self.BLK_KV),
+                scale,
+                math_tidx,
+            )
+        if num_blocks != cutlass.Int32(1):
+            last_blk = num_blocks - cutlass.Int32(1)
+            last_B = work_desc.seq_len - last_blk * cutlass.Int32(self.BLK_KV)
+            (
+                q_consumer_state,
+                k_consumer_state,
+                alpha_consumer_state,
+                beta_consumer_state,
+            ) = self.split_kk_qk_body(
+                sQ_SD,
+                sK_SD,
+                sQK,
+                sKK_inv,
+                sKK_opd,
+                sAlpha,
+                sBeta,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                beta_pipeline,
+                beta_consumer_state,
+                True,
+                last_B,
+                scale,
+                math_tidx,
+            )
+
+    @cute.jit
+    def run_split_v_role(
+        self,
+        sQ_SD: cute.Tensor,
+        sK_SD: cute.Tensor,
+        sK_DS: cute.Tensor,
+        sV_DS: cute.Tensor,
+        sQK: cute.Tensor,
+        sKK_opd: cute.Tensor,
+        sO: cute.Tensor,
+        sAlpha: cute.Tensor,
+        q_pipeline,
+        k_pipeline,
+        v_pipeline,
+        o_pipeline,
+        alpha_pipeline,
+        g_state: cute.Tensor,
+        g_init_state: cute.Tensor,
+        g_state_indices: cute.Tensor,
+        g_state_checkpoints: cute.Tensor,
+        checkpoint_cu_starts: cute.Tensor,
+        work_desc: WorkDesc,
+        scale: cutlass.Float32,
+        math_tidx: cutlass.Int32,
+        v_off: cutlass.Int32,
+        num_blocks: cutlass.Int32,
+        num_q_heads: cutlass.Int32,
+        num_v_heads: cutlass.Int32,
+        num_sab_heads: cutlass.Int32,
+        num_seqs: cutlass.Int32,
+        total_checkpoints: cutlass.Int32,
+        checkpoint_every_n_tokens: cutlass.Int32,
+    ):
+        q_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.q_stage
+        )
+        k_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.k_stage
+        )
+        alpha_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage
+        )
+        first_B = work_desc.seq_len
+        if first_B > cutlass.Int32(self.BLK_KV):
+            first_B = cutlass.Int32(self.BLK_KV)
+
+        v_tidx = math_tidx - cutlass.Int32(128)
+        # WG0 waits on SPLIT_EMPTY before publishing the first chunk.
+        cute.arch.barrier_arrive(
+            barrier_id=NamedBarrier.SPLIT_EMPTY,
+            number_of_threads=self._split_barrier_threads(),
+        )
+        v_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.v_stage
+        )
+        o_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.o_stage
+        )
+        sV_rows = cute.local_tile(
+            sV_DS,
+            (self.Dv, self.BLK_KV, self.v_stage),
+            (v_off // cutlass.Int32(self.Dv), 0, 0),
+        )
+        kv_tiled_mma = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16)),
+            cute.make_layout((self.num_v_warps, 1, 1)),
+            permutation_mnk=(self.Dv, self.D, self.BLK_KV),
+        )
+        kv_thr_mma = kv_tiled_mma.get_slice(v_tidx)
+        tKVrKV = cute.make_rmem_tensor(
+            kv_thr_mma.partition_shape_C((self.Dv, self.D)), self.acc_dtype
+        )
+        tKVrKV.fill(self.acc_dtype(0.0))
+
+        packed_state_layout = cute.make_ordered_layout(
+            (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
+        )
+        state_ref_shape = (g_state.shape[0], g_state.shape[1], self.D, self.D)
+        state_ref_layout = cute.make_layout(state_ref_shape, stride=g_state.stride)
+        indexed_state_layout = cute.select(state_ref_layout, mode=[3, 2, 1, 0])
+        state_idx = work_desc.seq_idx
+        if cutlass.const_expr(self.use_state_indices):
+            state_idx = cutlass.Int32(g_state_indices[work_desc.seq_idx])
+            state_layout = indexed_state_layout
+        else:
+            state_layout = packed_state_layout
+        o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
+        mState = cute.make_tensor(g_state.iterator, state_layout)
+        gStateKV = mState[None, None, o_head_idx, state_idx]
+        if cutlass.const_expr(self.needs_init_state):
+            init_state_ref_layout = cute.make_layout(
+                state_ref_shape, stride=g_init_state.stride
+            )
+            indexed_init_state_layout = cute.select(
+                init_state_ref_layout, mode=[3, 2, 1, 0]
+            )
+            if cutlass.const_expr(self.use_state_indices):
+                init_state_layout = indexed_init_state_layout
+            else:
+                init_state_layout = packed_state_layout
+            mInitState = cute.make_tensor(g_init_state.iterator, init_state_layout)
+            gInitKV = mInitState[None, None, o_head_idx, state_idx]
+            self.kv_load(tKVrKV, gInitKV, kv_thr_mma, v_off)
+
+        (
+            q_consumer_state,
+            k_consumer_state,
+            v_consumer_state,
+            o_producer_state,
+            alpha_consumer_state,
+        ) = self.split_v_body(
+            sQ_SD,
+            sK_SD,
+            sK_DS,
+            sV_rows,
+            sQK,
+            sKK_opd,
+            sO,
+            sAlpha,
+            kv_tiled_mma,
+            q_pipeline,
+            q_consumer_state,
+            k_pipeline,
+            k_consumer_state,
+            v_pipeline,
+            v_consumer_state,
+            o_pipeline,
+            o_producer_state,
+            alpha_pipeline,
+            alpha_consumer_state,
+            not self.needs_init_state,
+            True,
+            first_B,
+            tKVrKV,
+            scale,
+            v_tidx,
+        )
+        self.maybe_store_checkpoint(
+            tKVrKV,
+            g_state_checkpoints,
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
+            kv_thr_mma,
+            work_desc.seq_idx,
+            o_head_idx,
+            num_sab_heads,
+            total_checkpoints,
+            cutlass.Int32(self.BLK_KV),
+            work_desc.seq_len,
+            v_off,
+        )
+        for blk in cutlass.range(
+            cutlass.Int32(1),
+            num_blocks - cutlass.Int32(1),
+            cutlass.Int32(1),
+            unroll=1,
+        ):
+            (
+                q_consumer_state,
+                k_consumer_state,
+                v_consumer_state,
+                o_producer_state,
+                alpha_consumer_state,
+            ) = self.split_v_body(
+                sQ_SD,
+                sK_SD,
+                sK_DS,
+                sV_rows,
+                sQK,
+                sKK_opd,
+                sO,
+                sAlpha,
+                kv_tiled_mma,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                v_pipeline,
+                v_consumer_state,
+                o_pipeline,
+                o_producer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                False,
+                False,
+                cutlass.Int32(self.BLK_KV),
+                tKVrKV,
+                scale,
+                v_tidx,
+            )
+            self.maybe_store_checkpoint(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_thr_mma,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                v_off,
+            )
+        if num_blocks != cutlass.Int32(1):
+            last_blk = num_blocks - cutlass.Int32(1)
+            last_B = work_desc.seq_len - last_blk * cutlass.Int32(self.BLK_KV)
+            (
+                q_consumer_state,
+                k_consumer_state,
+                v_consumer_state,
+                o_producer_state,
+                alpha_consumer_state,
+            ) = self.split_v_body(
+                sQ_SD,
+                sK_SD,
+                sK_DS,
+                sV_rows,
+                sQK,
+                sKK_opd,
+                sO,
+                sAlpha,
+                kv_tiled_mma,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                v_pipeline,
+                v_consumer_state,
+                o_pipeline,
+                o_producer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                False,
+                True,
+                last_B,
+                tKVrKV,
+                scale,
+                v_tidx,
+            )
+            self.maybe_store_checkpoint(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_thr_mma,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                v_off,
+            )
+        self.kv_store(tKVrKV, gStateKV, kv_thr_mma, v_off)
 
     # ─── Warp role entry points ──────────────────────────────────────────────
     # The current DSL bridge still uses CTA-wide sync epochs, but each role owns
@@ -1573,7 +2349,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         )
         o_storage_layout = cute.tile_to_shape(
             o_smem_layout_atom,
-            (self.D, self.BLK_Q, self.o_stage),
+            (self.Dv, self.BLK_Q, self.o_stage),
             order=(1, 0, 2),
         )
         o_smem_layout = cute.slice_(o_storage_layout, (None, None, 0))
@@ -1591,7 +2367,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
 
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_o, tma_tensor_o = cpasync.make_tiled_tma_atom(
-            tma_store_op, g_o, o_smem_layout, (self.D, self.BLK_Q)
+            tma_store_op, g_o, o_smem_layout, (self.Dv, self.BLK_Q)
         )
 
         dtype_bytes = self.dtype.width // 8
@@ -1763,6 +2539,10 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             num_sab_heads,
         )
         tok_end = work_desc.tok_offset + work_desc.seq_len
+        v_off = None
+        if cutlass.const_expr(self.v_split > 1):
+            bx, _, _ = cute.arch.block_idx()
+            v_off = (bx % cutlass.Int32(self.v_split)) * cutlass.Int32(self.Dv)
         num_blocks = (
             work_desc.seq_len + cutlass.Int32(self.BLK_KV) - cutlass.Int32(1)
         ) // cutlass.Int32(self.BLK_KV)
@@ -1831,7 +2611,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         )
         o_layout = cute.tile_to_shape(
             o_smem_layout_atom,
-            (self.D, self.BLK_Q, self.o_stage),
+            (self.Dv, self.BLK_Q, self.o_stage),
             order=(1, 0, 2),
         )
         sO = storage.smem_o.get_tensor(o_layout.outer, swizzle=o_layout.inner)
@@ -1852,12 +2632,33 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         o_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, NUM_MMA_WARP_GROUPS * THREADS_PER_WARP_GROUP
         )
+        qk_consumer_group = load_consumer_group
+        v_consumer_group = load_consumer_group
+        alpha_consumer_group = vector_consumer_group
+        beta_consumer_group = vector_consumer_group
+        if cutlass.const_expr(self.v_split > 1):
+            # Q/K: WG0 warps + V-row warps; V: V-row warps; beta: WG0 only.
+            qk_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, WARPS_PER_WARP_GROUP + self.num_v_warps
+            )
+            v_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_v_warps
+            )
+            alpha_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, THREADS_PER_WARP_GROUP + 32 * self.num_v_warps
+            )
+            beta_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, THREADS_PER_WARP_GROUP
+            )
+            o_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32 * self.num_v_warps
+            )
         o_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32)
         q_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.q_mbar_ptr.data_ptr(),
             num_stages=self.q_stage,
             producer_group=load_producer_group,
-            consumer_group=load_consumer_group,
+            consumer_group=qk_consumer_group,
             tx_count=self.tma_load_q_bytes,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
@@ -1865,7 +2666,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             barrier_storage=storage.k_mbar_ptr.data_ptr(),
             num_stages=self.k_stage,
             producer_group=load_producer_group,
-            consumer_group=load_consumer_group,
+            consumer_group=qk_consumer_group,
             tx_count=self.tma_load_k_bytes,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
@@ -1873,7 +2674,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             barrier_storage=storage.v_mbar_ptr.data_ptr(),
             num_stages=self.v_stage,
             producer_group=load_producer_group,
-            consumer_group=load_consumer_group,
+            consumer_group=v_consumer_group,
             tx_count=self.tma_load_v_bytes,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
@@ -1887,13 +2688,13 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             barrier_storage=storage.alpha_mbar_ptr.data_ptr(),
             num_stages=self.alpha_beta_stage,
             producer_group=vector_producer_group,
-            consumer_group=vector_consumer_group,
+            consumer_group=alpha_consumer_group,
         )
         beta_pipeline = pipeline.PipelineAsync.create(
             barrier_storage=storage.beta_mbar_ptr.data_ptr(),
             num_stages=self.alpha_beta_stage,
             producer_group=vector_producer_group,
-            consumer_group=vector_consumer_group,
+            consumer_group=beta_consumer_group,
         )
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
@@ -1924,7 +2725,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                     work_desc.v_head_idx(),
                 )
             elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
-                CollectiveStoreTma(self.BLK_Q, self.D).run(
+                CollectiveStoreTma(self.BLK_Q, self.Dv, v_off).run(
                     sO,
                     tma_atom_o,
                     tma_tensor_o,
@@ -1962,41 +2763,94 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 )
         elif work_desc.seq_len != cutlass.Int32(0):
             cute.arch.setmaxregister_increase(mma_registers)
-
-            self.run_math_role(
-                sQ_SD,
-                sK_SD,
-                sK_DS,
-                sV_DS,
-                sQK,
-                sKK_inv,
-                sKK_opd,
-                sO,
-                sAlpha,
-                sBeta,
-                q_pipeline,
-                k_pipeline,
-                v_pipeline,
-                o_pipeline,
-                alpha_pipeline,
-                beta_pipeline,
-                g_state,
-                g_init_state,
-                g_state_indices,
-                g_state_checkpoints,
-                checkpoint_cu_starts,
-                work_desc,
-                scale,
-                wg_idx,
-                math_tidx,
-                num_blocks,
-                num_q_heads,
-                num_v_heads,
-                num_sab_heads,
-                num_seqs,
-                total_checkpoints,
-                checkpoint_every_n_tokens,
-            )
+            if cutlass.const_expr(self.v_split > 1):
+                if wg_idx == MathWarpGroupRole.KK:
+                    self.run_split_kk_role(
+                        sQ_SD,
+                        sK_SD,
+                        sQK,
+                        sKK_inv,
+                        sKK_opd,
+                        sAlpha,
+                        sBeta,
+                        q_pipeline,
+                        k_pipeline,
+                        alpha_pipeline,
+                        beta_pipeline,
+                        work_desc,
+                        scale,
+                        math_tidx,
+                        num_blocks,
+                    )
+                elif math_tidx - cutlass.Int32(THREADS_PER_WARP_GROUP) < cutlass.Int32(
+                    32 * self.num_v_warps
+                ):
+                    self.run_split_v_role(
+                        sQ_SD,
+                        sK_SD,
+                        sK_DS,
+                        sV_DS,
+                        sQK,
+                        sKK_opd,
+                        sO,
+                        sAlpha,
+                        q_pipeline,
+                        k_pipeline,
+                        v_pipeline,
+                        o_pipeline,
+                        alpha_pipeline,
+                        g_state,
+                        g_init_state,
+                        g_state_indices,
+                        g_state_checkpoints,
+                        checkpoint_cu_starts,
+                        work_desc,
+                        scale,
+                        math_tidx,
+                        v_off,
+                        num_blocks,
+                        num_q_heads,
+                        num_v_heads,
+                        num_sab_heads,
+                        num_seqs,
+                        total_checkpoints,
+                        checkpoint_every_n_tokens,
+                    )
+            else:
+                self.run_math_role(
+                    sQ_SD,
+                    sK_SD,
+                    sK_DS,
+                    sV_DS,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sO,
+                    sAlpha,
+                    sBeta,
+                    q_pipeline,
+                    k_pipeline,
+                    v_pipeline,
+                    o_pipeline,
+                    alpha_pipeline,
+                    beta_pipeline,
+                    g_state,
+                    g_init_state,
+                    g_state_indices,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    work_desc,
+                    scale,
+                    wg_idx,
+                    math_tidx,
+                    num_blocks,
+                    num_q_heads,
+                    num_v_heads,
+                    num_sab_heads,
+                    num_seqs,
+                    total_checkpoints,
+                    checkpoint_every_n_tokens,
+                )
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────
@@ -2013,6 +2867,7 @@ def _get_prefill_kernel(
     state_dtype,
     checkpoint_state_dtype,
     use_state_indices,
+    v_split,
     cu_seqlens_dtype,
     state_indices_dtype,
     checkpoint_cu_starts_dtype,
@@ -2029,6 +2884,7 @@ def _get_prefill_kernel(
         state_dtype=state_dtype_to_cutlass(state_dtype),
         checkpoint_state_dtype=state_dtype_to_cutlass(checkpoint_state_dtype),
         use_state_indices=use_state_indices,
+        v_split=v_split,
         cu_seqlens_dtype=cu_seqlens_dtype,
         state_indices_dtype=state_indices_dtype,
         checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
@@ -2162,7 +3018,10 @@ def delta_rule_prefill_dsl(
     )
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
 
-    workspace_size = get_device_sm_count(device) * 128
+    num_sms = get_device_sm_count(device)
+    v_split = choose_v_split_host(num_seqs * num_sab_heads, num_sms)
+
+    workspace_size = num_sms * 128
     tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, device)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
@@ -2178,6 +3037,7 @@ def delta_rule_prefill_dsl(
             state_checkpoints.dtype if needs_checkpointing else torch.float32
         ),
         use_state_indices=use_state_indices,
+        v_split=v_split,
         cu_seqlens_dtype=cu_seqlens.dtype,
         state_indices_dtype=state_indices.dtype if use_state_indices else None,
         checkpoint_cu_starts_dtype=(
@@ -2245,7 +3105,7 @@ def delta_rule_prefill_dsl(
             cutlass.Int32(num_seqs),
             cutlass.Int32(total_checkpoints),
             cutlass.Int32(checkpoint_every_n_tokens),
-            num_seqs * num_sab_heads,
+            num_seqs * num_sab_heads * v_split,
             stream,
         )
         compiled_delta_rule_kernel = cached_compile(
@@ -2275,6 +3135,6 @@ def delta_rule_prefill_dsl(
         num_seqs,
         total_checkpoints,
         checkpoint_every_n_tokens,
-        num_seqs * num_sab_heads,
+        num_seqs * num_sab_heads * v_split,
         stream,
     )

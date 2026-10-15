@@ -126,6 +126,39 @@ def should_use_cp_host(
     return num_parallel_work * threshold_den < num_sms * threshold_num
 
 
+def choose_v_split_host(num_parallel_work: int, num_sms: int) -> int:
+    """Number of CTAs the SM120 non-CP kernel splits each head's V rows across.
+
+    Returns the largest v_split in (1, 2, 4, 8) with
+    num_parallel_work * v_split <= num_sms, where num_parallel_work is the
+    number of (sequence, head) pairs.
+    """
+    v_split = 1
+    while v_split < 8 and num_parallel_work * v_split * 2 <= num_sms:
+        v_split *= 2
+    return v_split
+
+
+def sm120_non_cp_parallel_work_host(
+    num_parallel_work: int, num_sms: int, head_size: int
+) -> float:
+    """SM120 non-CP parallelism after V-split, in units of unsplit CTAs.
+
+    Per chunk of BLK tokens a V-split CTA still computes the V-independent
+    K K^T and Q K^T (4 * BLK^2 * D FLOPs) in full but only 1 / v_split of the
+    V-row GEMMs (6 * BLK * D^2 + 4 * BLK^2 * D FLOPs), so it finishes a chunk
+    faster by the ratio of the two per-CTA FLOP counts.
+    """
+    v_split = choose_v_split_host(num_parallel_work, num_sms)
+    v_rows_flops = 6 * BLK * head_size * head_size + 4 * BLK * BLK * head_size
+    shared_flops = 4 * BLK * BLK * head_size
+    return (
+        num_parallel_work
+        * (v_rows_flops + shared_flops)
+        / (v_rows_flops / v_split + shared_flops)
+    )
+
+
 def choose_cp_chunk_len_host(
     max_seqlen: int,
     num_heads: int,

@@ -47,6 +47,7 @@ from .gdn_kernels import (
 from .gdn_kernels.delta_rule_dsl.varlen_helper import (
     is_integer_dtype,
     should_use_cp_host,
+    sm120_non_cp_parallel_work_host,
 )
 
 
@@ -1271,8 +1272,13 @@ def chunk_gated_delta_rule(
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
+    non_cp_parallel_work = num_seqs * num_sab_heads
+    if _arch_major == 12:
+        non_cp_parallel_work = sm120_non_cp_parallel_work_host(
+            non_cp_parallel_work, _sm_count, head_size
+        )
     cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
-        num_seqs * num_sab_heads,
+        non_cp_parallel_work,
         _sm_count,
         _device_name,
         device_capability=_device_capability,

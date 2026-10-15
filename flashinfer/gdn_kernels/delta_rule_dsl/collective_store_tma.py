@@ -8,9 +8,11 @@ from .helpers import smid, tensormap_replace_global_dim_1
 
 
 class CollectiveStoreTma:
-    def __init__(self, blk_q: int, d: int):
+    def __init__(self, blk_q: int, d: int, d_offset=None):
         self.BLK_Q = blk_q
         self.D = d
+        # Row offset of this CTA's (d, blk_q) output tile inside the head dim.
+        self.d_offset = d_offset
 
     @cute.jit
     def tail_tensormap_gmem_ptr(self, g_tensormaps: cute.Tensor):
@@ -78,8 +80,9 @@ class CollectiveStoreTma:
         blk: cutlass.Int32,
         stage_idx: cutlass.Int32,
     ):
+        d_offset = cutlass.Int32(0) if self.d_offset is None else self.d_offset
         mO = cute.domain_offset(
-            (cutlass.Int32(0), work_desc.tok_offset + blk * cutlass.Int32(self.BLK_Q)),
+            (d_offset, work_desc.tok_offset + blk * cutlass.Int32(self.BLK_Q)),
             tma_tensor_o[None, None, o_head_idx],
         )
         gO = cute.zipped_divide(mO, (self.D, self.BLK_Q))[
