@@ -14,7 +14,7 @@
 """Triton MXFP8 q0 followed by route scatter."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import triton
@@ -46,6 +46,7 @@ TILE_K = 128
 BLOCK_K = TILE_K * UE8M0_PACK_NUM
 DIRECT_BLOCK_K = BLOCK_K * 2
 DECODE_BLOCK_N = 256
+DECODE_ZERO_BLOCK = 1024  # int64 words zero-filled per route-assign program (8 KiB)
 PREFILL_FUSED_PREFIX_MAX_EXPERTS = 1024
 
 
@@ -305,7 +306,14 @@ def mxfp8_q0_route_triton(
     workspace13: Optional[torch.Tensor] = None,
     workspace2: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    expert_offset: Optional[int] = None,
+    zero_buf: Optional[torch.Tensor] = None,
 ):
+    """``expert_offset``: when given, ``topk_ids`` are GLOBAL expert ids and this rank owns
+    [expert_offset, expert_offset + num_experts); other ids are unrouted.  Default: ids are
+    already local (negative = unrouted).
+    ``zero_buf``: a contiguous caller buffer the route zero-fills before any later op of the
+    chain runs (decode path: inside the route-assign kernel, no extra launch)."""
     _validate(x, topk_ids, topk_weights, num_experts)
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
@@ -318,11 +326,32 @@ def mxfp8_q0_route_triton(
         workspace = make_mxfp8_q0_route_workspace(
             x, topk_ids, num_experts, workspace13=workspace13, workspace2=workspace2
         )
+    zero_view = None
+    if zero_buf is not None:
+        if (
+            zero_buf.is_contiguous()
+            and (zero_buf.numel() * zero_buf.element_size()) % 8 == 0
+            and zero_buf.data_ptr() % 8 == 0
+        ):
+            zero_view = zero_buf.view(-1).view(torch.uint8).view(torch.int64)
+        else:
+            zero_buf.zero_()
     if total_pairs <= DECODE_BLOCK_N:
         total_scale = num_k_blocks * workspace.scale_out.shape[1]
+        zero_numel = 0 if zero_view is None else zero_view.numel()
         decode_grid = max(
-            num_experts, total_pairs, ceil_div(total_scale, DECODE_BLOCK_N)
+            num_experts,
+            total_pairs,
+            ceil_div(total_scale, DECODE_BLOCK_N),
+            ceil_div(zero_numel, DECODE_ZERO_BLOCK),
         )
+        extra: dict[str, Any] = {}
+        if expert_offset is not None:
+            extra.update(remap_ids=True, expert_offset=int(expert_offset))
+        if zero_numel > 0:
+            extra.update(
+                zero_ptr=zero_view, zero_numel=zero_numel, zero_block=DECODE_ZERO_BLOCK
+            )
         _route_assign_decode_kernel[(decode_grid,)](
             topk_ids,
             topk_weights,
@@ -341,6 +370,7 @@ def mxfp8_q0_route_triton(
             workspace.scale_out.shape[1],
             workspace.scale_out.stride(0),
             workspace.scale_out.stride(1),
+            **extra,
         )
         _mxfp8_q0_route_direct_kernel[(num_tokens, num_direct_blocks)](
             x,
@@ -372,6 +402,13 @@ def mxfp8_q0_route_triton(
             workspace.q_out,
             workspace.scale_out,
         )
+    if zero_view is not None:
+        zero_view.zero_()
+    if expert_offset is not None:
+        local = topk_ids - int(expert_offset)
+        topk_ids = torch.where(
+            (local >= 0) & (local < num_experts), local, torch.full_like(local, -1)
+        ).contiguous()
     block_n = 256
     workspace.scale_out.zero_()
     if num_experts <= PREFILL_FUSED_PREFIX_MAX_EXPERTS:

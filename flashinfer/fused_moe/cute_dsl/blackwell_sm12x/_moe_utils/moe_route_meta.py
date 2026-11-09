@@ -131,11 +131,32 @@ def route_assign_decode_kernel(
     padded_rows: tl.constexpr,
     s_som: tl.constexpr,
     s_sok: tl.constexpr,
+    remap_ids: tl.constexpr = False,
+    expert_offset: tl.constexpr = 0,
+    zero_ptr=None,
+    zero_numel: tl.constexpr = 0,
+    zero_block: tl.constexpr = 1024,
 ):
+    """With ``remap_ids``, ``topk_ids`` hold GLOBAL expert ids: an id in
+    [expert_offset, expert_offset + num_experts) is local expert id - expert_offset,
+    anything else is unrouted (-1).  With ``zero_numel > 0`` the grid also zero-fills
+    ``zero_ptr[0:zero_numel]`` (caller-owned output buffers), ``zero_block`` per program."""
     pid = tl.program_id(0)
     offs = tl.arange(0, block_n)
+    if zero_numel > 0:
+        zoffs = pid * zero_block + tl.arange(0, zero_block)
+        tl.store(
+            zero_ptr + zoffs,
+            tl.zeros((zero_block,), dtype=zero_ptr.dtype.element_ty),
+            mask=zoffs < zero_numel,
+        )
     # Unrouted (negative id) pairs take no row; see the module docstring.
     experts = tl.load(topk_ids + offs, mask=offs < total_pairs, other=-1)
+    if remap_ids:
+        experts = experts - expert_offset
+        experts = tl.where(
+            (offs < total_pairs) & (experts >= 0) & (experts < num_experts), experts, -1
+        )
     routed = experts >= 0
     flat = pid * block_n + offs
     k_block = flat // padded_rows
@@ -148,6 +169,11 @@ def route_assign_decode_kernel(
     tl.store(offsets + num_experts, tl.sum(tl.where(routed, 1, 0), 0), mask=pid == 0)
     is_pair = pid < total_pairs
     pair_expert = tl.load(topk_ids + pid, mask=is_pair, other=-1)
+    if remap_ids:
+        pair_expert = pair_expert - expert_offset
+        pair_expert = tl.where(
+            is_pair & (pair_expert >= 0) & (pair_expert < num_experts), pair_expert, -1
+        )
     pair_routed = pair_expert >= 0
     expert_begin = tl.sum(tl.where(routed & (experts < pair_expert), 1, 0), 0)
     rank = tl.sum(tl.where(routed & (experts == pair_expert) & (offs < pid), 1, 0), 0)
