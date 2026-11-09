@@ -23,7 +23,9 @@
     "hb_major",
     "sm_scale",
     "lse_scale",
-    "enable_pdl"
+    "enable_pdl",
+    "decode_pdl_trigger_on_entry",
+    "merge_pdl_trigger_on_entry"
   ],
   "candidates_per_chunk": 64,
   "decode_kernels": [

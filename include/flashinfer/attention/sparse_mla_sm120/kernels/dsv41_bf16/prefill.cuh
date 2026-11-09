@@ -37,8 +37,17 @@ __device__ __forceinline__ void run_bf16_tiles(
     if (tidx < R::CANDIDATES) sm.valid[tidx] = start + tidx < n ? ix[start + tidx] : -1;
     __syncthreads();
     auto gather = [&](bool power_of_two) __attribute__((always_inline)) {
+      // Issue every load of the chunk before decoding any of them (one memory
+      // round trip per chunk instead of one per pair of items). Same task -> thread
+      // mapping and the same decode, so shared memory receives identical bytes.
+      constexpr int ITEMS = (R::CANDIDATES * R::QK_VECTORS) / R::BLOCK_THREADS;
       static_assert((R::CANDIDATES * R::QK_VECTORS) % (2 * R::BLOCK_THREADS) == 0);
-      for (int first = tidx; first < R::CANDIDATES * R::QK_VECTORS; first += 2 * R::BLOCK_THREADS) {
+      uint64_t raw_all[ITEMS];
+      uint32_t scale_all[ITEMS];
+      bool valid_all[ITEMS];
+#pragma unroll
+      for (int pair = 0; pair < ITEMS / 2; ++pair) {
+        const int first = tidx + pair * 2 * R::BLOCK_THREADS;
         uint64_t raw[2];
         uint32_t scale_code[2];
         const uint8_t *data_addr[2] = {}, *scale_addr[2] = {};
@@ -94,19 +103,25 @@ __device__ __forceinline__ void run_bf16_tiles(
             : "memory");
 #pragma unroll
         for (int item = 0; item < 2; ++item) {
-          const int task = first + item * R::BLOCK_THREADS;
-          const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
-          const __nv_bfloat162 scale = valid[item]
-                                           ? decode_e4m3_or_ue8m0_scale_bf16(scale_code[item], fp4)
-                                           : __floats2bfloat162_rn(0.f, 0.f);
-          __nv_bfloat162 pairs[4];
-#pragma unroll
-          for (int j = 0; j < 4; ++j)
-            pairs[j] = __hmul2(
-                decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw[item] >> (j * (fp4 ? 8 : 16))), fp4),
-                scale);
-          *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
+          raw_all[pair * 2 + item] = raw[item];
+          scale_all[pair * 2 + item] = scale_code[item];
+          valid_all[pair * 2 + item] = valid[item];
         }
+      }
+#pragma unroll
+      for (int i = 0; i < ITEMS; ++i) {
+        const int task = tidx + i * R::BLOCK_THREADS;
+        const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
+        const __nv_bfloat162 scale = valid_all[i]
+                                         ? decode_e4m3_or_ue8m0_scale_bf16(scale_all[i], fp4)
+                                         : __floats2bfloat162_rn(0.f, 0.f);
+        __nv_bfloat162 pairs[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          pairs[j] = __hmul2(
+              decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw_all[i] >> (j * (fp4 ? 8 : 16))), fp4),
+              scale);
+        *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
       }
     };
     if (Cache::INLINE || (pbs & (pbs - 1)) == 0)

@@ -235,8 +235,13 @@ __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
 
 
 __global__ __launch_bounds__(384, 1) void
-kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major)
+kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32, int trigger_entry)
 {
+    // Fire the PDL trigger on entry so the merge (and the
+    // weight-staging K2' behind it) launch while this body runs. Launch timing only: every dependent waits for this
+    // whole grid in griddepcontrol.wait before reading its outputs or writing any global memory. The later
+    // triggers below stay (a repeated trigger is a no-op).
+    if (trigger_entry != 0) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -4530,6 +4535,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + tid_1 * 4))))[0]) = _pk2;
                     }
                     tmp[0] = acc[2];
@@ -4551,6 +4557,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + tid_1 * 4))))[0]) = _pk2;
                     }
                     tmp[0] = acc[8];
@@ -4572,6 +4579,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4))))[0]) = _pk2;
                     }
                     tmp[0] = acc[10];
@@ -4593,6 +4601,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4))))[0]) = _pk2;
                     }
                     tmp[0] = acc[16];
@@ -4614,6 +4623,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4))))[0]) = _pk2;
                     }
                     tmp[0] = acc[18];
@@ -4635,6 +4645,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4))))[0]) = _pk2;
                     }
                     tmp[0] = acc[24];
@@ -4656,6 +4667,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4))))[0]) = _pk2;
                     }
                     tmp[0] = acc[26];
@@ -4677,6 +4689,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if (mid_out_f32 != nullptr) { *reinterpret_cast<float4*>(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4))) = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]); } else
                         *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4))))[0]) = _pk2;
                     }
                     if (wt == 0 && tid_1 == 0) {
@@ -4725,6 +4738,7 @@ kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual(__nv_bfloat16* __restrict__ 
                         int dp = i_1 & 255;
                         {
                             __nv_bfloat162 _pk = __floats2bfloat162_rn(zero2s[0 + 0], zero2s[0 + 1]);
+                            if (mid_out_f32 != nullptr) { *reinterpret_cast<float2*>(mid_out_f32 + ((mbase + hh * scratch_split_stride) * 512 + dp * 2)) = make_float2(0.0f, 0.0f); } else
                             *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(mid_out + ((mbase + hh * scratch_split_stride) * 512 + dp * 2)))[0]) = _pk;
                         }
                     }
@@ -4980,7 +4994,7 @@ namespace decode_dual_default {
 cudaError_t launch(const DecodeArgs& a, dim3 grid, cudaStream_t stream) {
   static const cudaError_t smem_status = OptInDynamicSmem(reinterpret_cast<const void*>(&kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual), 96384);
   if (smem_status != cudaSuccess) return smem_status;
-  kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual<<<grid, 384, 96384, stream>>>(a.q, a.kv_cache, a.indices, a.extra_kv_cache, a.extra_indices, a.topk_length, a.extra_topk_length, a.attn_sink, a.output, a.out_lse, a.mid_out, a.mid_lse, a.topk, a.extra_topk, a.page_size, a.page_stride_bytes, a.extra_page_size, a.extra_page_stride_bytes, a.scratch_split_stride, a.chunks_per_block, a.sm_scale, a.lse_scale, a.write_direct, a.hb_major);
+  kernel_sm120_dsv41_mixed_sparse_mla_decode_h16_dual<<<grid, 384, 96384, stream>>>(a.q, a.kv_cache, a.indices, a.extra_kv_cache, a.extra_indices, a.topk_length, a.extra_topk_length, a.attn_sink, a.output, a.out_lse, a.mid_out, a.mid_lse, a.topk, a.extra_topk, a.page_size, a.page_stride_bytes, a.extra_page_size, a.extra_page_stride_bytes, a.scratch_split_stride, a.chunks_per_block, a.sm_scale, a.lse_scale, a.write_direct, a.hb_major, a.mid_out_f32, a.trigger_entry);
   return cudaGetLastError();
 }
 

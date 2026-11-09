@@ -60,6 +60,7 @@ Contract (shared with the SM120 ``"sparse"`` backend for this format):
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -182,6 +183,11 @@ class CakeDsv41MixedDispatch:
 
 
 DEFAULT_VARIANT = "default"
+# The 16-head dual fold render whose bodies also write fp32 split partials (the binding's
+# fp32 merge combines them). Merge-variant twins are irrelevant there (the fp32 merge replaces them).
+F32_FOLD_VARIANTS = frozenset(("sa+lq+el", "sa+pw+lq+el"))
+# Variants whose 16-head decode bodies take ``decode_pdl_trigger_on_entry``.
+_ENTRY_TRIGGER_VARIANTS = frozenset((DEFAULT_VARIANT,)) | F32_FOLD_VARIANTS
 
 
 def dispatch_from_manifest(manifest: dict) -> CakeDsv41MixedDispatch:
@@ -956,6 +962,8 @@ BINDING_PARAMS: Tuple[str, ...] = (
     "sm_scale",
     "lse_scale",
     "enable_pdl",
+    "decode_pdl_trigger_on_entry",
+    "merge_pdl_trigger_on_entry",
 )
 
 
@@ -1012,6 +1020,8 @@ def get_cake_sparse_mla_sm120_dsv41_mixed_module():
         sm_scale: float,
         lse_scale: float,
         enable_pdl: bool,
+        decode_pdl_trigger_on_entry: bool,
+        merge_pdl_trigger_on_entry: bool,
     ) -> None:
         entry(
             q,
@@ -1037,6 +1047,8 @@ def get_cake_sparse_mla_sm120_dsv41_mixed_module():
             sm_scale,
             lse_scale,
             enable_pdl,
+            decode_pdl_trigger_on_entry,
+            merge_pdl_trigger_on_entry,
         )
 
     @register_fake_op("flashinfer::cake_sparse_mla_sm120_dsv41_mixed_decode")
@@ -1156,6 +1168,38 @@ def _prepare_decode(
     )
 
 
+def _writes_fp32_partials(call: _DecodeCall) -> bool:
+    variant = call.plan.variant
+    return variant == DEFAULT_VARIANT or (
+        call.extra_flat is not None and variant in F32_FOLD_VARIANTS
+    )
+
+
+def _fp32_partials_plan(call: _DecodeCall, max_splits: int) -> _Plan:
+    """The plan for a 16-head call with float32 ``mid_out`` whose planned variant writes only BF16 partials."""
+
+    variant = DEFAULT_VARIANT
+    if call.extra_flat is not None:
+        pow2 = _is_pow2(call.page_size) and _is_pow2(call.extra_page_size)
+        variant = "sa+pw+lq+el" if pow2 else "sa+lq+el"
+    return _resolve_plan(
+        num_tokens=int(call.q.shape[0]),
+        num_heads=int(call.q.shape[1]),
+        topk=int(call.indices.shape[1]),
+        extra_topk=int(call.extra_indices.shape[1])
+        if call.extra_indices is not None
+        else 0,
+        dual=call.extra_flat is not None,
+        ragged=call.topk_length is not None or call.extra_topk_length is not None,
+        device=call.q.device,
+        num_splits=call.plan.num_splits,
+        max_splits=max_splits,
+        variant=variant,
+        page_size=call.page_size,
+        extra_page_size=call.extra_page_size,
+    )
+
+
 def _launch_decode(
     call: _DecodeCall,
     output: torch.Tensor,
@@ -1165,6 +1209,9 @@ def _launch_decode(
     sm_scale: float,
     lse_scale: float,
     enable_pdl: Optional[bool],
+    *,
+    decode_pdl_trigger_on_entry: bool = False,
+    merge_pdl_trigger_on_entry: bool = False,
 ) -> None:
     """Check the outputs and the split scratch against the plan, then launch."""
 
@@ -1198,12 +1245,29 @@ def _launch_decode(
             or mid_out.shape[1] != num_heads
             or mid_out.shape[2] < splits
             or mid_out.shape[3] != _D_V
-            or mid_out.dtype != torch.bfloat16
+            or mid_out.dtype not in (torch.bfloat16, torch.float32)
             or not mid_out.is_contiguous()
         ):
             raise ValueError(
-                f"mid_out must be a contiguous bfloat16 [{num_tokens}, {num_heads}, >= {splits}, {_D_V}] tensor, "
+                f"mid_out must be a contiguous bfloat16 (or float32) [{num_tokens}, {num_heads}, >= {splits}, {_D_V}] "
+                "tensor, "
                 f"got {tuple(mid_out.shape)} {mid_out.dtype}"
+            )
+        if mid_out.dtype == torch.float32 and (
+            num_heads != 16
+            or (
+                plan.variant != DEFAULT_VARIANT
+                and not (
+                    call.extra_flat is not None and plan.variant in F32_FOLD_VARIANTS
+                )
+            )
+        ):
+            # fp32 split partials are written only by the 16-head `default` bodies
+            # and the 16-head dual `sa+lq+el` / `sa+pw+lq+el` fold render.
+            raise ValueError(
+                "float32 mid_out requires 16 query heads and variant='default' (or a dual "
+                f"{sorted(F32_FOLD_VARIANTS)} render), got "
+                f"{num_heads} heads and variant {plan.variant!r}"
             )
         if (
             mid_lse.ndim != 3
@@ -1217,6 +1281,21 @@ def _launch_decode(
     else:
         mid_out = None
         mid_lse = None
+    if decode_pdl_trigger_on_entry and (
+        num_heads != 16 or plan.variant not in _ENTRY_TRIGGER_VARIANTS
+    ):
+        raise ValueError(
+            "decode_pdl_trigger_on_entry requires 16 query heads and variant in "
+            f"{sorted(_ENTRY_TRIGGER_VARIANTS)}, got {num_heads} heads and variant {plan.variant!r}"
+        )
+    if (
+        merge_pdl_trigger_on_entry
+        and splits > 1
+        and (mid_out is None or mid_out.dtype != torch.float32)
+    ):
+        raise ValueError(
+            "merge_pdl_trigger_on_entry requires float32 mid_out (the fp32 split merge)"
+        )
     get_cake_sparse_mla_sm120_dsv41_mixed_module().decode(
         q,
         call.kv_flat,
@@ -1241,6 +1320,8 @@ def _launch_decode(
         float(sm_scale),
         float(lse_scale),
         _resolve_enable_pdl(enable_pdl, q.device),
+        bool(decode_pdl_trigger_on_entry),
+        bool(merge_pdl_trigger_on_entry),
     )
 
 
@@ -1266,6 +1347,8 @@ def cake_sparse_mla_sm120_dsv41_mixed_decode(
     variant: Optional[str] = None,
     compute_precision: str = DEFAULT_COMPUTE_PRECISION,
     enable_pdl: Optional[bool] = None,
+    decode_pdl_trigger_on_entry: bool = False,
+    merge_pdl_trigger_on_entry: bool = False,
 ) -> Dict[str, Union[int, str]]:
     """Run the allocation-free Cake SM120 DSv4.1 mixed-cache sparse-MLA decode.
 
@@ -1279,6 +1362,22 @@ def cake_sparse_mla_sm120_dsv41_mixed_decode(
     plan. ``variant`` pins an exact variant of the export (every variant computes
     the same result; see :func:`cake_sparse_mla_sm120_dsv41_mixed_plan_variant`)
     and ``num_splits`` overrides the split planner.
+
+    Split partials: a float32 ``mid_out`` (16 query heads; variant ``"default"``, or
+    ``"sa+lq+el"`` / ``"sa+pw+lq+el"`` on the dual cache) keeps the split-K partials in
+    fp32 and merges them with an fp32 merge, so the output is rounded to BF16 once
+    (BF16 ``mid_out``, the default, rounds each partial to BF16 first). With
+    ``variant=None`` a split plan then runs the fastest of those variants.
+
+    PDL launch options (launch timing only; results are identical, and each dependent
+    still waits for the whole producing grid in ``griddepcontrol.wait``):
+
+    * ``decode_pdl_trigger_on_entry``: the decode body triggers its PDL dependents on
+      entry, so the split merge (or the next PDL kernel) launches while it runs. 16 query
+      heads, variants ``"default"`` / ``"sa+lq+el"`` / ``"sa+pw+lq+el"``.
+    * ``merge_pdl_trigger_on_entry``: the fp32 split merge (float32 ``mid_out``) triggers
+      its dependents before waiting on the decode grid. Set it only when the next launch
+      on the stream is a PDL kernel that reads these outputs after ``griddepcontrol.wait``.
     """
 
     call = _prepare_decode(
@@ -1295,8 +1394,28 @@ def cake_sparse_mla_sm120_dsv41_mixed_decode(
         variant=variant,
         compute_precision=compute_precision,
     )
+    if (
+        variant is None
+        and mid_out is not None
+        and mid_out.dtype == torch.float32
+        and call.plan.num_splits > 1
+        and int(q.shape[1]) == 16
+        and (call.extra_flat is not None or not _writes_fp32_partials(call))
+    ):
+        # Run the fastest body that writes fp32 partials: on the dual cache the fold render
+        # (RTX PRO 6000, 16 heads, batch 1-64: at least as fast as `default`), else `default`.
+        call = dataclasses.replace(call, plan=_fp32_partials_plan(call, max_splits))
     _launch_decode(
-        call, output, out_lse, mid_out, mid_lse, sm_scale, lse_scale, enable_pdl
+        call,
+        output,
+        out_lse,
+        mid_out,
+        mid_lse,
+        sm_scale,
+        lse_scale,
+        enable_pdl,
+        decode_pdl_trigger_on_entry=decode_pdl_trigger_on_entry,
+        merge_pdl_trigger_on_entry=merge_pdl_trigger_on_entry,
     )
     plan = call.plan
     return {

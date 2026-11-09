@@ -95,6 +95,119 @@ const int* LengthPointer(const Optional<TensorView>& value, const char* name, in
   return static_cast<const int*>(length.data_ptr());
 }
 
+// --- fp32 split partials ---------------------------------------------------------------
+// The h16 `default` decode bodies can write their normalized split partials in fp32 (DecodeArgs::mid_out_f32), so
+// the only BF16 rounding left is the output's. This merge is the stock `merge_default` body on fp32 partials: the
+// same base-2 split weights (ex2.approx of lse - max), the same sink fold and LSE (lg2.approx), fp32 accumulation in
+// split order, one BF16 rounding. Splits with an empty LSE sentinel are skipped instead of weighted by zero.
+__device__ __forceinline__ float CakeF32ApproxExp2(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float CakeF32ApproxLog2(float x) {
+  float y;
+  asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+// The partials are written by the decode grid this merge is a programmatic dependent of: they must be
+// plain (coherent) loads issued after griddepcontrol.wait, so they are deliberately not `const __restrict__`
+// (that lets nvcc emit non-coherent loads and hoist them above the wait), exactly like the stock merge.
+// kTriggerFirst: call griddepcontrol.launch_dependents on entry, before the wait, so the
+// next PDL kernel (csa2_lowm_wo_a, which stages only its weights/scales before its own griddepcontrol.wait) can
+// launch while this merge waits for the decode grid. Every partial load and every store stays after the wait; the
+// dependent's wait still covers this whole grid's completion. The <false> instance is the unchanged merge.
+template <bool kTriggerFirst>
+__global__ __launch_bounds__(64, 1) void CakeMergeF32Kernel(float* mid_out,
+                                                            float* mid_lse,
+                                                            const float* __restrict__ attn_sink,
+                                                            __nv_bfloat16* __restrict__ output,
+                                                            float* __restrict__ out_lse, int heads, int num_splits,
+                                                            int scratch_split_stride, float lse_scale, int hb_major) {
+  if constexpr (kTriggerFirst) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  const int lane = threadIdx.x;
+  const int token = hb_major != 0 ? blockIdx.y : blockIdx.x;
+  const int h = hb_major != 0 ? blockIdx.x : blockIdx.y;
+  const int row = token * heads + h;
+  const int lse_base = row * scratch_split_stride;
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  // Up to kMaxChunksPerBlock (16) splits: all LSEs, then all partial loads in flight, then the
+  // split-order accumulation (the stock merge's schedule, so no dependent load chain per split).
+  constexpr int kMaxSplits = 16;
+  float lse[kMaxSplits];
+#pragma unroll
+  for (int s = 0; s < kMaxSplits; ++s) {
+    float v = -1e+30f;
+    if (s < num_splits) asm volatile("ld.global.f32 %0, [%1];" : "=f"(v) : "l"(mid_lse + lse_base + s) : "memory");
+    lse[s] = v;
+  }
+  float gmax = lse[0];
+#pragma unroll
+  for (int s = 1; s < kMaxSplits; ++s) gmax = fmaxf(gmax, lse[s]);
+  float4 va[kMaxSplits];
+  float4 vb[kMaxSplits];
+  const float* base = mid_out + (static_cast<long long>(lse_base) * 512 + lane * 8);
+#pragma unroll
+  for (int s = 0; s < kMaxSplits; ++s) {
+    if (s < num_splits) {
+      // Coherent (ld.global, not .nc) vector loads, ordered after griddepcontrol.wait by the clobber.
+      const float* p = base + static_cast<long long>(s) * 512;
+      asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                   : "=f"(va[s].x), "=f"(va[s].y), "=f"(va[s].z), "=f"(va[s].w)
+                   : "l"(p)
+                   : "memory");
+      asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                   : "=f"(vb[s].x), "=f"(vb[s].y), "=f"(vb[s].z), "=f"(vb[s].w)
+                   : "l"(p + 4)
+                   : "memory");
+    } else {
+      va[s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      vb[s] = va[s];
+    }
+  }
+  float total = 0.0f;
+  float o[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int s = 0; s < kMaxSplits; ++s) {
+    if (lse[s] > -1e+29f) {
+      const float w = CakeF32ApproxExp2(lse[s] - gmax);
+      total = total + w;
+      o[0] = o[0] + va[s].x * w;
+      o[1] = o[1] + va[s].y * w;
+      o[2] = o[2] + va[s].z * w;
+      o[3] = o[3] + va[s].w * w;
+      o[4] = o[4] + vb[s].x * w;
+      o[5] = o[5] + vb[s].y * w;
+      o[6] = o[6] + vb[s].z * w;
+      o[7] = o[7] + vb[s].w * w;
+    }
+  }
+  float lse_out = __int_as_float(0xff800000);  // -inf
+  if (total > 0.0f) lse_out = CakeF32ApproxLog2(total) + gmax;
+  float osc = 1.0f;
+  if (attn_sink != nullptr) {
+    const float sink = attn_sink[h] * 1.4426950408889634f;
+    const float mx = fmaxf(gmax, sink);
+    if (total <= 0.0f) {
+      gmax = sink;
+      total = 1.0f;
+    } else {
+      osc = CakeF32ApproxExp2(gmax - mx);
+      total = total * osc + CakeF32ApproxExp2(sink - mx);
+      gmax = mx;
+    }
+    lse_out = CakeF32ApproxLog2(total) + gmax;
+  }
+  const float inv = total > 0.0f ? osc / total : 0.0f;
+  __nv_bfloat162 pk[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) pk[i] = __floats2bfloat162_rn(o[2 * i] * inv, o[2 * i + 1] * inv);
+  *reinterpret_cast<uint4*>(output + (static_cast<long long>(row) * 512 + lane * 8)) = *reinterpret_cast<uint4*>(&pk[0]);
+  if (lane == 0) out_lse[row] = (lse_out == -1e+30f) ? lse_out : lse_out * lse_scale;
+}
+
 }  // namespace
 
 // Cake SM120 DeepSeek-V4.1 mixed-cache sparse-MLA decode: ``output[t, h] = softmax(q[t, h] K^T * sm_scale) V``
@@ -119,13 +232,24 @@ const int* LengthPointer(const Optional<TensorView>& value, const char* name, in
 //   L2) or token-major (GB202 cards, where adjacent same-row CTAs contend in L2).
 //   enable_pdl: launch the split merge with the Programmatic Dependent Launch attribute (its CTAs start
 //   while the decode grid drains; the merge waits for the decode's memory before its first load).
+//   decode_pdl_trigger_on_entry: the decode body runs griddepcontrol.launch_dependents on entry, so a PDL
+//   dependent (the merge, or the caller's next PDL kernel) launches while the body runs. Launch timing only:
+//   every dependent still waits for the whole decode grid in griddepcontrol.wait. Served by the 16-head
+//   `default`, `sa+lq+el` and `sa+pw+lq+el` decode bodies.
+//   merge_pdl_trigger_on_entry: the fp32 split merge (float32 mid_out) runs griddepcontrol.launch_dependents
+//   before its own griddepcontrol.wait, so the caller's next PDL kernel launches while the merge waits.
+//   Set it only when that kernel reads this call's outputs after its griddepcontrol.wait.
 void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache, TensorView indices, Optional<TensorView> extra_kv_cache,
              Optional<TensorView> extra_indices, Optional<TensorView> topk_length,
              Optional<TensorView> extra_topk_length, Optional<TensorView> attn_sink, TensorView output,
              TensorView out_lse, Optional<TensorView> mid_out, Optional<TensorView> mid_lse, int64_t page_size,
              int64_t page_stride_bytes, int64_t extra_page_size, int64_t extra_page_stride_bytes,
              int64_t chunks_per_block, int64_t decode_body, int64_t merge_body, bool hb_major, double sm_scale,
-             double lse_scale, bool enable_pdl) {
+             double lse_scale, bool enable_pdl, bool decode_pdl_trigger_on_entry,
+             bool merge_pdl_trigger_on_entry) {
+  const bool pdl = enable_pdl;
+  const bool trigger_first = merge_pdl_trigger_on_entry;
+  const bool trigger_entry = decode_pdl_trigger_on_entry;
   TVM_FFI_CHECK(q.ndim() == 3, ValueError) << "q must be [tokens, heads, " << kHeadDim << "]";
   const int64_t tokens = q.size(0);
   const int64_t heads = q.size(1);
@@ -176,6 +300,7 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
 
   int64_t scratch_split_stride = 1;
   __nv_bfloat16* mid_out_ptr = static_cast<__nv_bfloat16*>(output.data_ptr());
+  float* mid_out_f32_ptr = nullptr;
   float* mid_lse_ptr = static_cast<float*>(out_lse.data_ptr());
   if (num_splits > 1) {
     TVM_FFI_CHECK(mid_out.has_value() && mid_lse.has_value(), ValueError)
@@ -183,12 +308,24 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
     const TensorView& mo = mid_out.value();
     const TensorView& ml = mid_lse.value();
     CheckDevice(mo, "mid_out", device, 16);
-    CheckDtype(mo, "mid_out", dl_bfloat16, "bfloat16");
+    const bool mid_f32 = encode_dlpack_dtype(mo.dtype()) == encode_dlpack_dtype(dl_float32);
+    if (mid_f32) {
+      // fp32 split partials: only the h16 `default` decode bodies and the h16 `sa+lq+el` / `sa+pw+lq+el` fold
+      // render write them.
+      TVM_FFI_CHECK(body.launch == &h16::decode_default::launch || body.launch == &h16::decode_dual_default::launch ||
+                        body.launch == &h16::decode_dual_sa_lq_el::launch ||
+                        body.launch == &h16::decode_dual_sa_pw_lq_el::launch,
+                    ValueError)
+          << "float32 mid_out is served only by the 16-head `default`, `sa+lq+el` and `sa+pw+lq+el` decode bodies";
+      mid_out_f32_ptr = static_cast<float*>(mo.data_ptr());
+    } else {
+      CheckDtype(mo, "mid_out", dl_bfloat16, "bfloat16");
+    }
     TVM_FFI_CHECK(mo.ndim() == 4 && mo.size(0) == tokens && mo.size(1) == heads && mo.size(2) >= num_splits &&
                       mo.size(3) == kValueDim && mo.IsContiguous(),
                   ValueError)
         << "mid_out must be a contiguous [" << tokens << ", " << heads << ", >= " << num_splits << ", " << kValueDim
-        << "] bfloat16 tensor";
+        << "] bfloat16 (or float32) tensor";
     CheckDevice(ml, "mid_lse", device, 4);
     CheckDtype(ml, "mid_lse", dl_float32, "float32");
     TVM_FFI_CHECK(ml.ndim() == 3 && ml.size(0) == tokens && ml.size(1) == heads && ml.size(2) == mo.size(2) &&
@@ -229,6 +366,20 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
   args.lse_scale = static_cast<float>(lse_scale);
   args.write_direct = num_splits == 1 ? 1 : 0;
   args.hb_major = hb_major ? 1 : 0;
+  args.mid_out_f32 = mid_out_f32_ptr;
+  TVM_FFI_CHECK(!trigger_first || num_splits == 1 || mid_out_f32_ptr != nullptr, ValueError)
+      << "merge_pdl_trigger_on_entry is served only by the float32 split merge (float32 mid_out)";
+  if (trigger_entry) {
+    // Only these bodies take DecodeArgs::trigger_entry; any other body would silently ignore it.
+    TVM_FFI_CHECK(body.launch == &h16::decode_default::launch || body.launch == &h16::decode_dual_default::launch ||
+                      body.launch == &h16::decode_dual_sa_lq_el::launch ||
+                      body.launch == &h16::decode_dual_sa_pw_lq_el::launch,
+                  ValueError)
+        << "decode_pdl_trigger_on_entry is served only by the 16-head `default`, `sa+lq+el` and "
+           "`sa+pw+lq+el` decode bodies, not decode body "
+        << decode_body;
+  }
+  args.trigger_entry = trigger_entry ? 1 : 0;
   const unsigned heads_per_cta = static_cast<unsigned>(kHeadsPerBlock * body.tiles);
   const unsigned decode_blocks = static_cast<unsigned>((heads + heads_per_cta - 1) / heads_per_cta);
   const unsigned ntok = static_cast<unsigned>(tokens);
@@ -250,7 +401,33 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
     merge.hb_major = args.hb_major;
     const unsigned nheads = static_cast<unsigned>(heads);
     const dim3 merge_grid = hb_major ? dim3(nheads, ntok, 1) : dim3(ntok, nheads, 1);
-    status = merge_kernel.launch(merge, merge_grid, enable_pdl, stream);
+    if (mid_out_f32_ptr != nullptr) {
+      cudaLaunchConfig_t config{};
+      config.gridDim = merge_grid;
+      config.blockDim = dim3(64, 1, 1);
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+      if (trigger_first) {
+        status = cudaLaunchKernelEx(&config, CakeMergeF32Kernel<true>, mid_out_f32_ptr, mid_lse_ptr,
+                                    static_cast<const float*>(sink),
+                                    args.output, args.out_lse, static_cast<int>(heads), static_cast<int>(num_splits),
+                                    static_cast<int>(scratch_split_stride), static_cast<float>(lse_scale),
+                                    static_cast<int>(args.hb_major));
+      } else {
+        status = cudaLaunchKernelEx(&config, CakeMergeF32Kernel<false>, mid_out_f32_ptr, mid_lse_ptr,
+                                    static_cast<const float*>(sink),
+                                    args.output, args.out_lse, static_cast<int>(heads), static_cast<int>(num_splits),
+                                    static_cast<int>(scratch_split_stride), static_cast<float>(lse_scale),
+                                    static_cast<int>(args.hb_major));
+      }
+    } else {
+      status = merge_kernel.launch(merge, merge_grid, pdl, stream);
+    }
     TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
         << "Cake SM120 DSV4.1 mixed-cache sparse MLA merge launch failed: " << cudaGetErrorString(status);
   }

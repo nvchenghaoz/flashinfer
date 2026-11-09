@@ -236,10 +236,18 @@ __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
 
 namespace fold {
 
-template <bool kPow2Pages>
+// kF32Mid instantiations write the normalized split partials in fp32 to mid_out_f32 (same
+// element layout as mid_out, same values the `default` body writes) for the binding's fp32 merge; the BF16
+// instantiations ignore mid_out_f32.
+template <bool kPow2Pages, bool kF32Mid>
 __global__ __launch_bounds__(384, 1) void
-decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major)
+decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32, int trigger_entry)
 {
+    // Fire the PDL trigger on entry so the merge (and the
+    // weight-staging K2' behind it) launch while this body runs. Launch timing only: every dependent waits for this
+    // whole grid in griddepcontrol.wait before reading its outputs or writing any global memory. The later
+    // triggers below stay (a repeated trigger is a no-op).
+    if (trigger_entry != 0) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -4533,6 +4541,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4556,6 +4569,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4579,6 +4597,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4602,6 +4625,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 16 + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4625,6 +4653,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4648,6 +4681,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 32 + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4671,6 +4709,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + gid * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4694,6 +4737,11 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                         _pk[0] = __floats2bfloat162_rn(tmp[0 + 0], tmp[0 + 1]);
                         _pk[1] = __floats2bfloat162_rn(tmp[0 + 2], tmp[0 + 3]);
+                        if constexpr (kF32Mid) {
+                        asm volatile(
+                            "st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;"
+                            :: "l"((void*)(mid_out_f32 + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4)))), "f"(tmp[0]), "f"(tmp[1]), "f"(tmp[2]), "f"(tmp[3]), "l"(0x14F0000000000000ULL) : "memory");
+                        } else
                         asm volatile(
                             "st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
                             :: "l"((void*)(&((__nv_bfloat16*)(mid_out + (((token * 16 + hs_t) * scratch_split_stride + split) * 512 + (gid + 8) * (scratch_split_stride * 512) + (dbase + 48 + tid_1 * 4))))[0])), "r"(_pk2.x), "r"(_pk2.y), "l"(0x14F0000000000000ULL) : "memory");
@@ -4744,6 +4792,7 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
                         int dp = i_1 & 255;
                         {
                             __nv_bfloat162 _pk = __floats2bfloat162_rn(zero2s[0 + 0], zero2s[0 + 1]);
+                            if constexpr (kF32Mid) { *reinterpret_cast<float2*>(mid_out_f32 + ((mbase + hh * scratch_split_stride) * 512 + dp * 2)) = make_float2(0.0f, 0.0f); } else
                             *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(mid_out + ((mbase + hh * scratch_split_stride) * 512 + dp * 2)))[0]) = _pk;
                         }
                     }
@@ -5021,8 +5070,13 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
     // Cleanup
 }
 
-template __global__ void decode_body<false>(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major);
-template __global__ void decode_body<true>(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major);
+#define CAKE_FOLD_H16_INSTANTIATE(P2, F32) \
+template __global__ void decode_body<P2, F32>(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32, int trigger_entry);
+CAKE_FOLD_H16_INSTANTIATE(false, false)
+CAKE_FOLD_H16_INSTANTIATE(true, false)
+CAKE_FOLD_H16_INSTANTIATE(false, true)
+CAKE_FOLD_H16_INSTANTIATE(true, true)
+#undef CAKE_FOLD_H16_INSTANTIATE
 } // namespace fold
 
 }  // namespace fold_dual_sa_lq_el_pw_h16
@@ -5064,14 +5118,25 @@ template __global__ void decode_body<true>(__nv_bfloat16* __restrict__ q, uint8_
 #undef kv_empty_addr
 #undef kv_full_addr
 
+namespace fold_dual_sa_lq_el_pw_h16 {
+
+// A non-null DecodeArgs::mid_out_f32 launches the fp32-partials instantiation.
+template <bool kPow2Pages, bool kF32Mid>
+cudaError_t launch_one(const DecodeArgs& a, dim3 grid, cudaStream_t stream) {
+  static const cudaError_t smem_status = OptInDynamicSmem(reinterpret_cast<const void*>(&fold::decode_body<kPow2Pages, kF32Mid>), 98432);
+  if (smem_status != cudaSuccess) return smem_status;
+  fold::decode_body<kPow2Pages, kF32Mid><<<grid, 384, 98432, stream>>>(a.q, a.kv_cache, a.indices, a.extra_kv_cache, a.extra_indices, a.topk_length, a.extra_topk_length, a.attn_sink, a.output, a.out_lse, a.mid_out, a.mid_lse, a.topk, a.extra_topk, a.page_size, a.page_stride_bytes, a.extra_page_size, a.extra_page_stride_bytes, a.scratch_split_stride, a.chunks_per_block, a.sm_scale, a.lse_scale, a.write_direct, a.hb_major, a.mid_out_f32, a.trigger_entry);
+  return cudaGetLastError();
+}
+
+}  // namespace fold_dual_sa_lq_el_pw_h16
+
 namespace h16 {
 namespace decode_dual_sa_lq_el {
 
 cudaError_t launch(const DecodeArgs& a, dim3 grid, cudaStream_t stream) {
-  static const cudaError_t smem_status = OptInDynamicSmem(reinterpret_cast<const void*>(&fold_dual_sa_lq_el_pw_h16::fold::decode_body<false>), 98432);
-  if (smem_status != cudaSuccess) return smem_status;
-  fold_dual_sa_lq_el_pw_h16::fold::decode_body<false><<<grid, 384, 98432, stream>>>(a.q, a.kv_cache, a.indices, a.extra_kv_cache, a.extra_indices, a.topk_length, a.extra_topk_length, a.attn_sink, a.output, a.out_lse, a.mid_out, a.mid_lse, a.topk, a.extra_topk, a.page_size, a.page_stride_bytes, a.extra_page_size, a.extra_page_stride_bytes, a.scratch_split_stride, a.chunks_per_block, a.sm_scale, a.lse_scale, a.write_direct, a.hb_major);
-  return cudaGetLastError();
+  return a.mid_out_f32 != nullptr ? fold_dual_sa_lq_el_pw_h16::launch_one<false, true>(a, grid, stream)
+                                  : fold_dual_sa_lq_el_pw_h16::launch_one<false, false>(a, grid, stream);
 }
 
 }  // namespace decode_dual_sa_lq_el
@@ -5081,10 +5146,8 @@ namespace h16 {
 namespace decode_dual_sa_pw_lq_el {
 
 cudaError_t launch(const DecodeArgs& a, dim3 grid, cudaStream_t stream) {
-  static const cudaError_t smem_status = OptInDynamicSmem(reinterpret_cast<const void*>(&fold_dual_sa_lq_el_pw_h16::fold::decode_body<true>), 98432);
-  if (smem_status != cudaSuccess) return smem_status;
-  fold_dual_sa_lq_el_pw_h16::fold::decode_body<true><<<grid, 384, 98432, stream>>>(a.q, a.kv_cache, a.indices, a.extra_kv_cache, a.extra_indices, a.topk_length, a.extra_topk_length, a.attn_sink, a.output, a.out_lse, a.mid_out, a.mid_lse, a.topk, a.extra_topk, a.page_size, a.page_stride_bytes, a.extra_page_size, a.extra_page_stride_bytes, a.scratch_split_stride, a.chunks_per_block, a.sm_scale, a.lse_scale, a.write_direct, a.hb_major);
-  return cudaGetLastError();
+  return a.mid_out_f32 != nullptr ? fold_dual_sa_lq_el_pw_h16::launch_one<true, true>(a, grid, stream)
+                                  : fold_dual_sa_lq_el_pw_h16::launch_one<true, false>(a, grid, stream);
 }
 
 }  // namespace decode_dual_sa_pw_lq_el

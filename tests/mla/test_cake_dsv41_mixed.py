@@ -1516,6 +1516,140 @@ def test_gpu_every_exported_variant_matches_reference(
         )
 
 
+def _decode_into(q, cache, indices, mid_dtype, splits, **kwargs):
+    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
+    mid_out = torch.empty(
+        (num_tokens, num_heads, splits, _D), dtype=mid_dtype, device="cuda"
+    )
+    mid_lse = torch.empty(
+        (num_tokens, num_heads, splits), dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty_like(q)
+    lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device="cuda")
+    plan = cake_sparse_mla_sm120_dsv41_mixed_decode(
+        q,
+        cache,
+        indices,
+        output,
+        lse,
+        _SM_SCALE,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+        num_splits=splits,
+        **kwargs,
+    )
+    assert plan["num_splits"] == splits
+    return output, lse
+
+
+@pytest.mark.parametrize(
+    "dual,variant",
+    [
+        (False, "default"),
+        (True, "default"),
+        (True, "sa+lq+el"),
+        (True, "sa+pw+lq+el"),
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32, 64, 128])
+def test_gpu_fp32_partials_and_entry_triggers(
+    num_tokens: int, dual: bool, variant: str
+) -> None:
+    """16 heads: float32 ``mid_out`` matches the reference at least as closely as BF16 partials, and the PDL entry
+    triggers (decode body, fp32 merge) leave both outputs bit-identical."""
+
+    _require_family()
+    num_heads, topk, extra_topk = 16, 128, 512
+    if variant not in _exported_variants(kernel_dispatch(), 16, dual=dual):
+        pytest.skip(f"variant {variant!r} not exported")
+    torch.manual_seed(20261109 + num_tokens + 2 * dual)
+    q = _query(num_tokens, num_heads)
+    cache = _main_pool(16, 64)
+    indices = _indices(num_tokens, topk, 16 * 64)
+    indices[0, -5:] = -1
+    sink = torch.randn(num_heads, device="cuda")
+    kwargs: dict = dict(attn_sink=sink, variant=variant)
+    reference_kwargs: dict = {}
+    if dual:
+        extra = _extra_pool(128, 64)
+        extra_indices = _indices(num_tokens, extra_topk, 128 * 64)
+        kwargs.update(extra_kv_cache=extra, extra_indices=extra_indices)
+        reference_kwargs = dict(extra_cache=extra, extra_indices=extra_indices)
+    expected = _reference(q, cache, indices, attn_sink=sink, **reference_kwargs)
+    chunks = cake_sparse_mla_sm120_dsv41_mixed_num_chunks(
+        topk, extra_topk if dual else 0
+    )
+    for splits in sorted({2, chunks}):
+        bf16 = _decode_into(q, cache, indices, torch.bfloat16, splits, **kwargs)
+        fp32 = _decode_into(q, cache, indices, torch.float32, splits, **kwargs)
+        _check("bf16", fp32, expected)
+        bf16_err = (bf16[0].float() - expected[0]).abs().mean().item()
+        fp32_err = (fp32[0].float() - expected[0]).abs().mean().item()
+        assert fp32_err <= bf16_err * 1.001 + 1e-7, (splits, fp32_err, bf16_err)
+        for mid_dtype, base in ((torch.bfloat16, bf16), (torch.float32, fp32)):
+            triggered = _decode_into(
+                q,
+                cache,
+                indices,
+                mid_dtype,
+                splits,
+                enable_pdl=True,
+                decode_pdl_trigger_on_entry=True,
+                merge_pdl_trigger_on_entry=mid_dtype == torch.float32,
+                **kwargs,
+            )
+            assert torch.equal(triggered[0], base[0])
+            assert torch.equal(triggered[1], base[1])
+    if variant == "default":
+        # variant=None with float32 partials runs a body that writes them, whatever the planner picks.
+        kwargs.pop("variant")
+        mid_out = torch.empty(
+            (num_tokens, num_heads, chunks, _D), dtype=torch.float32, device="cuda"
+        )
+        mid_lse = torch.empty(
+            (num_tokens, num_heads, chunks), dtype=torch.float32, device="cuda"
+        )
+        output = torch.empty_like(q)
+        lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device="cuda")
+        plan = cake_sparse_mla_sm120_dsv41_mixed_decode(
+            q,
+            cache,
+            indices,
+            output,
+            lse,
+            _SM_SCALE,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+            **kwargs,
+        )
+        if plan["num_splits"] > 1:
+            assert plan["variant"] in ("default", "sa+lq+el", "sa+pw+lq+el")
+        _check("bf16", (output, lse), expected)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64, 128])
+def test_gpu_fp32_partials_and_triggers_reject_unserved_bodies(num_heads: int) -> None:
+    """The fp32 partials and the decode entry trigger exist only on the 16-head `default` / fold bodies, and the
+    merge trigger only on the fp32 merge; every other pairing is rejected instead of silently ignored."""
+
+    _require_family()
+    num_tokens, topk = 4, 128
+    q = _query(num_tokens, num_heads)
+    cache = _main_pool(16, 64)
+    indices = _indices(num_tokens, topk, 16 * 64)
+    if num_heads != 16:
+        with pytest.raises(ValueError, match="float32 mid_out"):
+            _decode_into(q, cache, indices, torch.float32, 2)
+        with pytest.raises(ValueError, match="decode_pdl_trigger_on_entry"):
+            _decode_into(
+                q, cache, indices, torch.bfloat16, 2, decode_pdl_trigger_on_entry=True
+            )
+    with pytest.raises(ValueError, match="merge_pdl_trigger_on_entry"):
+        _decode_into(
+            q, cache, indices, torch.bfloat16, 2, merge_pdl_trigger_on_entry=True
+        )
+
+
 @pytest.mark.parametrize("num_heads", [8, 64])
 def test_gpu_non_pow2_pages_run_the_generic_page_resolve(num_heads: int) -> None:
     """Pages of 61 / 53 rows: the dispatch drops the shift-and-mask page resolve (`pw`), a pinned `pw` variant is
