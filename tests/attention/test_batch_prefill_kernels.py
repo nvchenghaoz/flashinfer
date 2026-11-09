@@ -2305,6 +2305,89 @@ def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len
         torch.testing.assert_close(o_i, o_ref_i, rtol=2e-3, atol=2e-3)
 
 
+@pytest.mark.parametrize("kv_cache", ["ragged", "paged"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_shared_kv_smem_kv_alias_bitwise(kv_cache, causal, dtype):
+    """K and V passed as the same tensor (MQA/MLA-style shared latent KV, so
+    head_dim_qk == head_dim_vo) must give bitwise the same output and LSE as the
+    same data passed as two separate copies.
+
+    At head_dim 512 with 16-bit KV the FA2 ragged and paged kernels run with
+    KernelTraits::USE_KV_SHARED_SMEM for every CTA tile the planner can pick
+    (see test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides), where V is
+    loaded into the K buffer after Q.K^T. When K and V alias, the kernels skip
+    that V reload for full KV tiles and keep it for the partial last tile. The
+    cases cover KV lengths that are and are not multiples of the KV tile,
+    requests of different lengths, split-KV (a long single request) and batch
+    sizes from 1 to 128; paged uses a partially filled last page.
+    """
+    head_dim = 512
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(0)
+    num_kv_heads, num_qo_heads, page_size = 1, 8, 16
+    # (batch_size, qo_len, kv_len); request i gets kv_len + 64 * (i % 2) keys.
+    cases = [(1, 64, 2048), (3, 17, 97), (16, 33, 256), (128, 5, 130)]
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    for batch_size, qo_len, kv_len in cases:
+        kv_lens = [kv_len + 64 * (i % 2) for i in range(batch_size)]
+        q = torch.randn(
+            batch_size * qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=dtype
+        )
+        q_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+        if kv_cache == "ragged":
+            kv = torch.randn(
+                sum(kv_lens), num_kv_heads, head_dim, device="cuda:0", dtype=dtype
+            )
+            kv_indptr = torch.tensor([0] + kv_lens).cumsum(0).int()
+            wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+                workspace_buffer, "NHD", backend="fa2"
+            )
+            wrapper.plan(
+                q_indptr.to(0),
+                kv_indptr.to(0),
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                causal=causal,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+            )
+            o_alias, lse_alias = wrapper.run(q, kv, kv, return_lse=True)
+            o_copy, lse_copy = wrapper.run(q, kv, kv.clone(), return_lse=True)
+        else:
+            num_pages = [(n + page_size - 1) // page_size for n in kv_lens]
+            kv = torch.randn(
+                sum(num_pages),
+                page_size,
+                num_kv_heads,
+                head_dim,
+                device="cuda:0",
+                dtype=dtype,
+            )
+            wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD", backend="fa2"
+            )
+            wrapper.plan(
+                q_indptr.to(0),
+                torch.tensor([0] + num_pages).cumsum(0).int().to(0),
+                torch.arange(sum(num_pages), dtype=torch.int32, device="cuda:0"),
+                torch.tensor([(n - 1) % page_size + 1 for n in kv_lens]).int().to(0),
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                causal=causal,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+            )
+            o_alias, lse_alias = wrapper.run(q, (kv, kv), return_lse=True)
+            o_copy, lse_copy = wrapper.run(q, (kv, kv.clone()), return_lse=True)
+        assert not o_copy.isnan().any()
+        assert torch.equal(o_alias, o_copy), (batch_size, qo_len, kv_len)
+        assert torch.equal(lse_alias, lse_copy), (batch_size, qo_len, kv_len)
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 256])
 @pytest.mark.parametrize("qo_len", [64, 128])

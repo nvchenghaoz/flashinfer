@@ -3626,6 +3626,21 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                        kv_head_idx * v_stride_h +
                        (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack;
 
+      // K/V alias fast path (shared K/V smem, 16-bit KV, no RoPE, no repack). When K and V are
+      // the same tensor with the same strides, V(iter) of a FULL tile is byte-identical to K(iter),
+      // which already sits at identical positions of the time-shared k_smem buffer, so the V reload
+      // is skipped. Partial tiles keep the V load (K uses kNoFill, V uses kFillZero).
+      constexpr bool kKVAliasCapable = KTraits::USE_KV_SHARED_SMEM && sizeof(DTypeKV) == 2 &&
+                                       !is_fp4_type_v<DTypeKV> && !kRepackActive &&
+                                       KTraits::POS_ENCODING_MODE != PosEncodingMode::kRoPELlama;
+      // Number of leading full KV tiles whose V reload is skipped (0 when K and V do not alias).
+      [[maybe_unused]] uint32_t num_alias_full_tiles = 0;
+      if constexpr (kKVAliasCapable) {
+        if ((k == v) && (k_stride_n == v_stride_n) && (k_stride_h == v_stride_h)) {
+          num_alias_full_tiles = chunk_size / CTA_TILE_KV;
+        }
+      }
+
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                              k_stride_n, 0, chunk_size, tid);
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
@@ -3732,15 +3747,25 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         // FP8 V scale for this tile: loaded in the same cp.async group as V(iter), so no
         // extra wait is needed.
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
-          // Load V(iter) into k_smem (time-shared) now that Q.K^T is done.
-          produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
-              v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, iter * CTA_TILE_KV, chunk_size, tid);
-          produce_kv_token_head_sf<true, KTraits>(
-              &smem_storage, reinterpret_cast<const float*>(maybe_v_cache_sf), v_stride_n,
-              v_stride_h, kv_head_idx, kv_abs_base, iter * CTA_TILE_KV, chunk_size, warp_idx,
-              lane_idx);
-          cp_async::commit_group();
-          cp_async::wait_group<0>();
+          bool skip_v_load = false;
+          if constexpr (kKVAliasCapable) {
+            skip_v_load = iter < num_alias_full_tiles;
+          }
+          if (skip_v_load) {
+            // V(iter) == K(iter), already resident in k_smem; keep v_ptr in step with
+            // produce_kv's per-tile advance (CTA_TILE_KV rows).
+            v_ptr += static_cast<size_t>(CTA_TILE_KV) * v_stride_n;
+          } else {
+            // Load V(iter) into k_smem (time-shared) now that Q.K^T is done.
+            produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+                v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, iter * CTA_TILE_KV, chunk_size, tid);
+            produce_kv_token_head_sf<true, KTraits>(
+                &smem_storage, reinterpret_cast<const float*>(maybe_v_cache_sf), v_stride_n,
+                v_stride_h, kv_head_idx, kv_abs_base, iter * CTA_TILE_KV, chunk_size, warp_idx,
+                lane_idx);
+            cp_async::commit_group();
+            cp_async::wait_group<0>();
+          }
         } else {
           produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
@@ -4530,6 +4555,25 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
+      // K/V alias fast path (shared K/V smem, 16-bit KV, no RoPE, no repack, not multi-item
+      // scoring). When the K and V pools are the same tensor with the same strides, V(iter) of a
+      // FULL tile is byte-identical to K(iter), which already sits at identical positions of the
+      // time-shared k_smem buffer, so the V reload is skipped. Partial tiles keep the V load.
+      constexpr bool kKVAliasCapable = KTraits::USE_KV_SHARED_SMEM && sizeof(DTypeKV) == 2 &&
+                                       !is_fp4_type_v<DTypeKV> && !kRepackActive &&
+                                       KTraits::POS_ENCODING_MODE != PosEncodingMode::kRoPELlama &&
+                                       MASK_MODE != MaskMode::kMultiItemScoring;
+      // Number of leading full KV tiles whose V reload is skipped (0 when K and V do not alias).
+      [[maybe_unused]] uint32_t num_alias_full_tiles = 0;
+      if constexpr (kKVAliasCapable) {
+        if ((paged_kv.k_data == paged_kv.v_data) &&
+            (paged_kv.stride_page == paged_kv.v_stride_page) &&
+            (paged_kv.stride_n == paged_kv.v_stride_n) &&
+            (paged_kv.stride_h == paged_kv.v_stride_h)) {
+          num_alias_full_tiles = chunk_size / CTA_TILE_KV;
+        }
+      }
+
       uint32_t packed_page_iter_base =
           paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
       if constexpr (KTraits::USE_KV_SHARED_SMEM) {
@@ -4644,245 +4688,268 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                : chunk_size) /
           CTA_TILE_KV;
 
+      // Instantiate the KV loop separately for aliased K/V so the non-aliased loop carries no
+      // per-tile alias branch (a runtime branch here measurably slowed non-aliased inputs).
+      auto kv_loop = [&](auto kv_alias_c) {
+        constexpr bool kKVAlias = decltype(kv_alias_c)::value;
 #pragma unroll 1
-      for (uint32_t iter = 0; iter < num_iterations;
-           iter = (MASK_MODE == MaskMode::kMultiItemScoring)
-                      ? ((iter + 1 == num_iterations_prefix) ? num_iterations_mask : (iter + 1))
-                      : (iter + 1)) {
-        const uint32_t prefetch_skip_step =
-            (MASK_MODE == MaskMode::kMultiItemScoring)
-                ? ((iter + 1 == num_iterations_prefix)
-                       ? (num_iterations_mask - num_iterations_prefix)
-                       : 0)
-                : 0;
-        const uint32_t next_packed_page_iter_base =
-            packed_page_iter_base + (1 + prefetch_skip_step) * CTA_TILE_KV;
-        if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
-          packed_page_iter_base = next_packed_page_iter_base;
+        for (uint32_t iter = 0; iter < num_iterations;
+             iter = (MASK_MODE == MaskMode::kMultiItemScoring)
+                        ? ((iter + 1 == num_iterations_prefix) ? num_iterations_mask : (iter + 1))
+                        : (iter + 1)) {
+          const uint32_t prefetch_skip_step =
+              (MASK_MODE == MaskMode::kMultiItemScoring)
+                  ? ((iter + 1 == num_iterations_prefix)
+                         ? (num_iterations_mask - num_iterations_prefix)
+                         : 0)
+                  : 0;
+          const uint32_t next_packed_page_iter_base =
+              packed_page_iter_base + (1 + prefetch_skip_step) * CTA_TILE_KV;
+          if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
+            packed_page_iter_base = next_packed_page_iter_base;
 #pragma unroll
-          for (uint32_t i = 0;
-               i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q;
-               ++i) {
-            uint32_t page_iter, entry_idx;
-            paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
-                                          lane_idx / KV_THR_LAYOUT_COL +
-                                          KV_THR_LAYOUT_ROW * NUM_WARPS_Q * NUM_WARPS_KV * i,
-                                      page_iter, entry_idx);
-            // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to fp8
-            constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
-            const uint32_t feat_idx =
-                (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
-            thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
-                page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
-            if constexpr (!SAME_KV_STRIDES) {
-              thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+            for (uint32_t i = 0;
+                 i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q;
+                 ++i) {
+              uint32_t page_iter, entry_idx;
+              paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
+                                            lane_idx / KV_THR_LAYOUT_COL +
+                                            KV_THR_LAYOUT_ROW * NUM_WARPS_Q * NUM_WARPS_KV * i,
+                                        page_iter, entry_idx);
+              // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to
+              // fp8
+              constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
+              const uint32_t feat_idx =
+                  (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
+              thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
                   page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+              if constexpr (!SAME_KV_STRIDES) {
+                thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+                    page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+              }
             }
           }
-        }
-        // FP8 K scale for this tile: loaded in the same cp.async group as K(iter), so no
-        // extra wait is needed.
-        // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
-        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
-          cp_async::wait_group<0>();
-        } else {
-          cp_async::wait_group<1>();
-        }
-        block.sync();
-
-        uint32_t kv_idx_base =
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
-        [[maybe_unused]] uint32_t kv_rope_base =
-            kv_idx_base +
-            (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]);
-
-        if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-          if constexpr (!is_fp4_type_v<DTypeKV>) {
-            k_smem_inplace_apply_rotary<KTraits>(
-                (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]) +
-                    chunk_start + iter * CTA_TILE_KV,
-                &k_smem, &k_smem_offset_r, rope_freq, tid);
-            block.sync();
+          // FP8 K scale for this tile: loaded in the same cp.async group as K(iter), so no
+          // extra wait is needed.
+          // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
+          if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+            cp_async::wait_group<0>();
+          } else {
+            cp_async::wait_group<1>();
           }
-        }
-
-        // compute attention score
-        if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-                      is_fp4_type_v<DTypeKV>) {
-          compute_qk_fp4_rope<KTraits>(
-              &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-              smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                         16 * KTraits::NUM_MMA_D_QK),
-              lane_idx, kv_rope_base, rope_freq, s_frag);
-        } else if constexpr (kRepackActive) {
-          // Dequantize one-byte K -> 16-bit staging smem (shuffle-free), then read native 16-bit.
-          repack_kv_tile_to_16b<KTraits, KTraits::HEAD_DIM_QK>(
-              smem_storage.k_smem, smem_storage.k_sf_smem_ptr(), smem_storage.kv_smem_repack_ptr(),
-              warp_idx * WARP_SIZE + lane_idx);
           block.sync();
-          compute_qk<KTraits, /*REPACK_BF16=*/true>(
-              &qo_smem, &q_smem_offset_r, &k_smem_bf16, &k_smem_offset_r_bf16,
-              smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                         16 * KTraits::NUM_MMA_D_QK),
-              lane_idx, s_frag,
-              smem_storage.k_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                            16));
-        } else if constexpr (KTraits::USE_FP8_MMA) {
-          compute_qk_fp8<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-        } else {
-          compute_qk<KTraits>(
-              &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-              smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                         16 * KTraits::NUM_MMA_D_QK),
-              lane_idx, s_frag,
-              smem_storage.k_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                            16));
-        }
-        logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                  kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                  kv_head_idx);
 
-        // apply mask
-        if (MASK_MODE == MaskMode::kCustom) {
-          logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                               kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                               kv_head_idx);
-        } else {
-          if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-            if (iter >= mask_iteration || iter < window_iteration) {
-              logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                                   kv_head_idx);
+          uint32_t kv_idx_base =
+              chunk_start +
+              (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+          [[maybe_unused]] uint32_t kv_rope_base =
+              kv_idx_base +
+              (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]);
+
+          if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+            if constexpr (!is_fp4_type_v<DTypeKV>) {
+              k_smem_inplace_apply_rotary<KTraits>(
+                  (paged_kv.rope_pos_offset == nullptr ? 0
+                                                       : paged_kv.rope_pos_offset[request_idx]) +
+                      chunk_start + iter * CTA_TILE_KV,
+                  &k_smem, &k_smem_offset_r, rope_freq, tid);
+              block.sync();
             }
-          } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
-            if (iter + 1 >= num_iterations_prefix) {
-              logits_mask_multi_item_scoring<KTraits>(
-                  params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base,
-                  qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
-                  __ldg(maybe_prefix_len_ptr + request_idx),
-                  maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
-                  kv_head_idx);
-            } else {
+          }
+
+          // compute attention score
+          if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
+                        is_fp4_type_v<DTypeKV>) {
+            compute_qk_fp4_rope<KTraits>(
+                &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
+                smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                           16 * KTraits::NUM_MMA_D_QK),
+                lane_idx, kv_rope_base, rope_freq, s_frag);
+          } else if constexpr (kRepackActive) {
+            // Dequantize one-byte K -> 16-bit staging smem (shuffle-free), then read native 16-bit.
+            repack_kv_tile_to_16b<KTraits, KTraits::HEAD_DIM_QK>(
+                smem_storage.k_smem, smem_storage.k_sf_smem_ptr(),
+                smem_storage.kv_smem_repack_ptr(), warp_idx * WARP_SIZE + lane_idx);
+            block.sync();
+            compute_qk<KTraits, /*REPACK_BF16=*/true>(
+                &qo_smem, &q_smem_offset_r, &k_smem_bf16, &k_smem_offset_r_bf16,
+                smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                           16 * KTraits::NUM_MMA_D_QK),
+                lane_idx, s_frag,
+                smem_storage.k_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) *
+                                              KTraits::NUM_MMA_KV * 16));
+          } else if constexpr (KTraits::USE_FP8_MMA) {
+            compute_qk_fp8<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+          } else {
+            compute_qk<KTraits>(
+                &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
+                smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                           16 * KTraits::NUM_MMA_D_QK),
+                lane_idx, s_frag,
+                smem_storage.k_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) *
+                                              KTraits::NUM_MMA_KV * 16));
+          }
+          logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                    kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                    kv_head_idx);
+
+          // apply mask
+          if (MASK_MODE == MaskMode::kCustom) {
+            logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                 kv_head_idx);
+          } else {
+            if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
               if (iter >= mask_iteration || iter < window_iteration) {
                 logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                      kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag,
                                      tid, kv_head_idx);
               }
+            } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
+              if (iter + 1 >= num_iterations_prefix) {
+                logits_mask_multi_item_scoring<KTraits>(
+                    params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base,
+                    qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
+                    __ldg(maybe_prefix_len_ptr + request_idx),
+                    maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
+                    kv_head_idx);
+              } else {
+                if (iter >= mask_iteration || iter < window_iteration) {
+                  logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx,
+                                       qo_packed_idx_base, kv_idx_base, qo_len, kv_len, chunk_end,
+                                       group_size, s_frag, tid, kv_head_idx);
+                }
+              }
             }
           }
-        }
 
-        // compute m,d states in online softmax
-        if constexpr (KTraits::USE_VO_SPLIT) {
-          // VO-split: cross-warp consistent m/d + stage P to p_smem; o_scale is the
-          // online rescale to apply to o_frag in vosplit_compute_pv below.
-          vosplit_softmax_store_p<KTraits>(variant, s_frag, m, d, o_scale, &smem_storage,
-                                           get_warp_idx_kv<KTraits>(tid.z),
-                                           get_warp_idx_q<KTraits>(tid.y), lane_idx);
-        } else {
-          update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
-        }
-
-        block.sync();
-        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
-          page_produce_kv_on_the_fly<true, KTraits>(
-              &smem_storage, &v_smem_offset_w, paged_kv.v_data, paged_kv, packed_page_iter_base,
-              last_indptr, kv_head_idx, iter * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
-          page_produce_kv_token_head_sf<true, KTraits>(
-              &smem_storage, reinterpret_cast<const float*>(maybe_v_cache_sf),
-              packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-              v_sf_stride_page, v_sf_stride_h, v_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              iter * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
-          cp_async::commit_group();
-          cp_async::wait_group<0>();
-        } else {
-          page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
-                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
-                                          chunk_size, warp_idx, lane_idx);
-          page_produce_kv_sf<false, KTraits>(
-              &smem_storage, maybe_k_cache_sf, packed_page_iter_base,
-              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, k_sf_stride_page,
-              k_sf_stride_h, k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
-          page_produce_kv_token_head_sf<false, KTraits>(
-              &smem_storage, reinterpret_cast<const float*>(maybe_k_cache_sf),
-              packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-              k_sf_stride_page, k_sf_stride_h, k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
-          cp_async::commit_group();
-          cp_async::wait_group<1>();
-        }
-        block.sync();
-
-        // compute sfm*v
-        if constexpr (KTraits::USE_VO_SPLIT) {
-          const uint32_t warp_vo_base =
-              get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
-          if constexpr (KTraits::USE_FP8_MMA) {
-            vosplit_compute_pv_fp8<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
-                                            get_warp_idx_q<KTraits>(tid.y), lane_idx);
+          // compute m,d states in online softmax
+          if constexpr (KTraits::USE_VO_SPLIT) {
+            // VO-split: cross-warp consistent m/d + stage P to p_smem; o_scale is the
+            // online rescale to apply to o_frag in vosplit_compute_pv below.
+            vosplit_softmax_store_p<KTraits>(variant, s_frag, m, d, o_scale, &smem_storage,
+                                             get_warp_idx_kv<KTraits>(tid.z),
+                                             get_warp_idx_q<KTraits>(tid.y), lane_idx);
           } else {
-            vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
-                                        get_warp_idx_q<KTraits>(tid.y), lane_idx);
+            update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
           }
-        } else if constexpr (kRepackActive) {
-          // Dequantize one-byte V -> 16-bit staging smem (shuffle-free), then read native 16-bit.
-          repack_kv_tile_to_16b<KTraits, KTraits::HEAD_DIM_VO>(
-              smem_storage.v_smem, smem_storage.v_sf_smem_ptr(), smem_storage.kv_smem_repack_ptr(),
-              warp_idx * WARP_SIZE + lane_idx);
+
           block.sync();
-          compute_sfm_v<KTraits, /*REPACK_BF16=*/true>(
-              &v_smem_bf16, &v_smem_offset_r_bf16,
-              smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                         16 * KTraits::NUM_MMA_D_VO),
-              lane_idx, s_frag, o_frag, d, d_base,
-              smem_storage.v_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                            16));
-        } else {
-          compute_sfm_v<KTraits>(
-              &v_smem, &v_smem_offset_r,
-              smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                         16 * KTraits::NUM_MMA_D_VO),
-              lane_idx, s_frag, o_frag, d, d_base,
-              smem_storage.v_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
-                                            16));
-        }
-
-        block.sync();
-        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
-          page_produce_kv_on_the_fly<false, KTraits>(
-              &smem_storage, &k_smem_offset_w, paged_kv.k_data, paged_kv,
-              next_packed_page_iter_base, last_indptr, kv_head_idx, (iter + 1) * CTA_TILE_KV,
-              chunk_size, warp_idx, lane_idx);
-          page_produce_kv_token_head_sf<false, KTraits>(
-              &smem_storage, reinterpret_cast<const float*>(maybe_k_cache_sf),
-              next_packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-              k_sf_stride_page, k_sf_stride_h, k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
-          cp_async::commit_group();
-          packed_page_iter_base = next_packed_page_iter_base;
-        } else {
-          if constexpr (SAME_KV_STRIDES) {
-            page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
-                                           chunk_size, warp_idx, lane_idx);
+          if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+            bool skip_v_load = false;
+            if constexpr (kKVAlias) {
+              skip_v_load = iter < num_alias_full_tiles;
+            }
+            if (!skip_v_load) {
+              page_produce_kv_on_the_fly<true, KTraits>(
+                  &smem_storage, &v_smem_offset_w, paged_kv.v_data, paged_kv, packed_page_iter_base,
+                  last_indptr, kv_head_idx, iter * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              page_produce_kv_token_head_sf<true, KTraits>(
+                  &smem_storage, reinterpret_cast<const float*>(maybe_v_cache_sf),
+                  packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                  v_sf_stride_page, v_sf_stride_h, v_sf_stride_n, paged_kv.page_size,
+                  paged_kv.indices, iter * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              cp_async::commit_group();
+              cp_async::wait_group<0>();
+            }
           } else {
-            page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
-                                           chunk_size, warp_idx, lane_idx);
+            page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
+                                            (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
+                                            chunk_size, warp_idx, lane_idx);
+            page_produce_kv_sf<false, KTraits>(
+                &smem_storage, maybe_k_cache_sf, packed_page_iter_base,
+                last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, k_sf_stride_page,
+                k_sf_stride_h, k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
+                (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+            page_produce_kv_token_head_sf<false, KTraits>(
+                &smem_storage, reinterpret_cast<const float*>(maybe_k_cache_sf),
+                packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                k_sf_stride_page, k_sf_stride_h, k_sf_stride_n, paged_kv.page_size,
+                paged_kv.indices, (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+            cp_async::commit_group();
+            cp_async::wait_group<1>();
           }
-          page_produce_kv_sf<true, KTraits>(
-              &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
-              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, v_sf_stride_page,
-              v_sf_stride_h, v_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
-          page_produce_kv_token_head_sf<true, KTraits>(
-              &smem_storage, reinterpret_cast<const float*>(maybe_v_cache_sf),
-              packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-              v_sf_stride_page, v_sf_stride_h, v_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
-          cp_async::commit_group();
+          block.sync();
+
+          // compute sfm*v
+          if constexpr (KTraits::USE_VO_SPLIT) {
+            const uint32_t warp_vo_base =
+                get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
+            if constexpr (KTraits::USE_FP8_MMA) {
+              vosplit_compute_pv_fp8<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
+                                              get_warp_idx_q<KTraits>(tid.y), lane_idx);
+            } else {
+              vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
+                                          get_warp_idx_q<KTraits>(tid.y), lane_idx);
+            }
+          } else if constexpr (kRepackActive) {
+            // Dequantize one-byte V -> 16-bit staging smem (shuffle-free), then read native 16-bit.
+            repack_kv_tile_to_16b<KTraits, KTraits::HEAD_DIM_VO>(
+                smem_storage.v_smem, smem_storage.v_sf_smem_ptr(),
+                smem_storage.kv_smem_repack_ptr(), warp_idx * WARP_SIZE + lane_idx);
+            block.sync();
+            compute_sfm_v<KTraits, /*REPACK_BF16=*/true>(
+                &v_smem_bf16, &v_smem_offset_r_bf16,
+                smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                           16 * KTraits::NUM_MMA_D_VO),
+                lane_idx, s_frag, o_frag, d, d_base,
+                smem_storage.v_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) *
+                                              KTraits::NUM_MMA_KV * 16));
+          } else {
+            compute_sfm_v<KTraits>(
+                &v_smem, &v_smem_offset_r,
+                smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                           16 * KTraits::NUM_MMA_D_VO),
+                lane_idx, s_frag, o_frag, d, d_base,
+                smem_storage.v_scale_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) *
+                                              KTraits::NUM_MMA_KV * 16));
+          }
+
+          block.sync();
+          if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+            page_produce_kv_on_the_fly<false, KTraits>(
+                &smem_storage, &k_smem_offset_w, paged_kv.k_data, paged_kv,
+                next_packed_page_iter_base, last_indptr, kv_head_idx, (iter + 1) * CTA_TILE_KV,
+                chunk_size, warp_idx, lane_idx);
+            page_produce_kv_token_head_sf<false, KTraits>(
+                &smem_storage, reinterpret_cast<const float*>(maybe_k_cache_sf),
+                next_packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                k_sf_stride_page, k_sf_stride_h, k_sf_stride_n, paged_kv.page_size,
+                paged_kv.indices, (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+            cp_async::commit_group();
+            packed_page_iter_base = next_packed_page_iter_base;
+          } else {
+            if constexpr (SAME_KV_STRIDES) {
+              page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
+                                             (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
+                                             chunk_size, warp_idx, lane_idx);
+            } else {
+              page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
+                                             (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
+                                             chunk_size, warp_idx, lane_idx);
+            }
+            page_produce_kv_sf<true, KTraits>(
+                &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
+                last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, v_sf_stride_page,
+                v_sf_stride_h, v_sf_stride_n, paged_kv.page_size, paged_kv.indices,
+                (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+            page_produce_kv_token_head_sf<true, KTraits>(
+                &smem_storage, reinterpret_cast<const float*>(maybe_v_cache_sf),
+                packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                v_sf_stride_page, v_sf_stride_h, v_sf_stride_n, paged_kv.page_size,
+                paged_kv.indices, (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+            cp_async::commit_group();
+          }
         }
+      };
+      if constexpr (kKVAliasCapable) {
+        if (num_alias_full_tiles > 0) {
+          kv_loop(std::true_type{});
+        } else {
+          kv_loop(std::false_type{});
+        }
+      } else {
+        kv_loop(std::false_type{});
       }
       cp_async::wait_group<0>();
       block.sync();
