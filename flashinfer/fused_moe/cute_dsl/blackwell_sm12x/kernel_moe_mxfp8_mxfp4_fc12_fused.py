@@ -1486,7 +1486,8 @@ def cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4(
     sync = from_dlpack(
         sync_workspace(a_q.device), assumed_align=16
     ).mark_layout_dynamic()
-    args = (*args1[:9], *args2[:7], sync, args1[9])
+    split = fc1k.make_split_args(a_q.device)
+    args = (*args1[:7], *split, *args2[:7], sync, args1[7])
     assert ceil_div(n1, 128) <= KCOLS_MAX, "KACQ: more fc1 column tiles than KCOLS_MAX"
     key = (op1.tactic, op2.tactic, enable_pdl, swiglu_limit, grid_x, sm_version)
     hit = _COMPILED.get(key)

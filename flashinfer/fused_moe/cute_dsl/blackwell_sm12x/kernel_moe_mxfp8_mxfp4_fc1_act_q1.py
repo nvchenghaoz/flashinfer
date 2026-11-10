@@ -757,10 +757,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         self.cfg = cfg
         self.grid_x = grid_x
         self.qcfg = qcfg
-        # Device-side dynamic split-K (swap-AB decode tile only); see _moe_utils/split_k.py.
-        self.split_k = cfg.mma.swap_ab
-        self.split_max = split_k.MAX_SPLITS
-        self.split_min = split_k.MIN_SPLITS
         self.epi_q = EPI_CONFIGS[cfg.epi.METHOD](
             cutlass.Float8E4M3FN,
             cfg.mma_threads,
@@ -808,8 +804,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         gD: cute.Tensor,
         gSFQ_u8: cute.Tensor,
         offsets: cute.Tensor,
-        gSplit: cute.Tensor,
-        gCnt: cute.Tensor,
         stream,
     ):
         cfg = self.cfg
@@ -978,8 +972,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
             gD,
             gSFQ_u8,
             offsets,
-            gSplit,
-            gCnt,
             a_smem,
             b_smem,
             sfa_smem,
@@ -1011,8 +1003,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         gD: cute.Tensor,
         gSFQ_u8: cute.Tensor,
         offsets: cute.Tensor,
-        gSplit: cute.Tensor,
-        gCnt: cute.Tensor,
         a_smem,
         b_smem,
         sfa_smem,
@@ -1118,97 +1108,29 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         quant_threads_n = self.epi_q.s2g_threads_n(cfg.TILE)
         tiled_s2r = cfg.epi.make_tiled_s2r(cfg.TILE)
         tiled_s2r_q = self.epi_q.make_tiled_s2r(cfg.TILE)
-        split_act = cfg.activation
 
         if cfg.is_prod_wg(warp_idx):
             cute.arch.setmaxregister_decrease(cfg.reg_prod)
 
             if warp_idx == cfg.sched_warp:
-                if cutlass.const_expr(self.split_k):
-                    # Dynamic split-K: S from the live tile count T (no host sync).
-                    prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
-                    # Count loads and the scheduler's own loads are issued back to back,
-                    # before either is used, so the count adds no round trip.
-                    cl = split_k.count_loads(offsets, num_groups)
-                    sched = moe_scheduler.MoeTileScheduler.create(
-                        pm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
+                sched = moe_scheduler.MoeTileScheduler.create(
+                    pm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
+                )
+                prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
+                has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
+                while has:
+                    if cutlass.const_expr(swap):
+                        m_tile, n_tile = n_tile, m_tile
+                    prod.publish(
+                        sWork,
+                        sfull,
+                        sempty,
+                        moe_scheduler.MoeWorkTile(
+                            m_tile, n_tile, e, m_off, m_bnd, i32(1)
+                        ),
                     )
-                    mb_lane = split_k.count_m_blocks_lane(
-                        cl[0],
-                        cl[1],
-                        cl[2],
-                        cl[3],
-                        cl[4],
-                        cl[5],
-                        cl[6],
-                        cl[7],
-                        offsets,
-                        num_groups,
-                        pm,
-                    )
-                    T_k = split_k.warp_total(mb_lane) * num_n_blocks
                     has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
-                    S_k = split_k.choose_splits(
-                        T_k, self.grid_x, self.split_max, num_sf_cycles, self.split_min
-                    )
-                    if S_k == i32(1):
-                        while has:
-                            prod.publish(
-                                sWork,
-                                sfull,
-                                sempty,
-                                moe_scheduler.MoeWorkTile(
-                                    n_tile, m_tile, e, m_off, m_bnd, i32(1)
-                                ),
-                            )
-                            has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(
-                                offsets
-                            )
-                    else:
-                        # T * S <= grid: CTA bidx owns unit bidx = (tile bidx // S,
-                        # slice bidx % S) and nothing else.
-                        if bidx < T_k * S_k:
-                            sched2 = moe_scheduler.MoeTileScheduler.create(
-                                pm, num_groups, num_n_blocks, 1, bidx // S_k, offsets
-                            )
-                            has2, e, m_tile, n_tile, m_off, m_bnd = (
-                                sched2.get_next_block(offsets)
-                            )
-                            prod.publish(
-                                sWork,
-                                sfull,
-                                sempty,
-                                moe_scheduler.MoeWorkTile(
-                                    n_tile,
-                                    m_tile,
-                                    e,
-                                    m_off,
-                                    m_bnd,
-                                    i32(1) + (S_k << 16),
-                                ),
-                            )
-                    prod.publish_sentinel(sWork, sfull, sempty)
-                else:
-                    sched = moe_scheduler.MoeTileScheduler.create(
-                        pm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
-                    )
-                    prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
-                    has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
-                    while has:
-                        if cutlass.const_expr(swap):
-                            m_tile, n_tile = n_tile, m_tile
-                        prod.publish(
-                            sWork,
-                            sfull,
-                            sempty,
-                            moe_scheduler.MoeWorkTile(
-                                m_tile, n_tile, e, m_off, m_bnd, i32(1)
-                            ),
-                        )
-                        has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(
-                            offsets
-                        )
-                    prod.publish_sentinel(sWork, sfull, sempty)
+                prod.publish_sentinel(sWork, sfull, sempty)
 
             if warp_idx == cfg.load_warp_0:
                 if cutlass.const_expr(cfg.enable_pdl and not swap):
@@ -1221,11 +1143,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                         cute.arch.mbarrier_wait(epi_empty, epi_empty_phase)
                         epi_empty_phase ^= 1
                     if cutlass.const_expr(swap):
-                        c_lo, c_hi = i32(0), num_sf_cycles
-                        if cutlass.const_expr(self.split_k):
-                            c_lo, c_hi = split_k.cycle_range(
-                                tile.valid, bidx, num_sf_cycles
-                            )
                         a_phase = load_a_sfa_swap(
                             tma_atom_a,
                             tma_atom_sfa,
@@ -1242,12 +1159,11 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                             a_empty,
                             self.a_bytes,
                             self.sfa_bytes,
-                            c_hi,
+                            num_sf_cycles,
                             sf_stages,
                             kt_per_pack_c,
                             cfg.ab_stage,
                             a_phase,
-                            c_lo,
                         )
                     else:
                         a_phase = load_a_sfa(
@@ -1282,11 +1198,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                         cute.arch.mbarrier_wait(epi_empty, epi_empty_phase)
                         epi_empty_phase ^= 1
                     if cutlass.const_expr(swap):
-                        c_lo, c_hi = i32(0), num_sf_cycles
-                        if cutlass.const_expr(self.split_k):
-                            c_lo, c_hi = split_k.cycle_range(
-                                tile.valid, bidx, num_sf_cycles
-                            )
                         b_phase = load_b_sfb_swap(
                             tma_atom_b,
                             tma_atom_sfb,
@@ -1300,12 +1211,11 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                             b_empty,
                             self.b_bytes,
                             self.sfb_bytes,
-                            c_hi,
+                            num_sf_cycles,
                             sf_stages,
                             kt_per_pack_c,
                             cfg.ab_stage,
                             b_phase,
-                            c_lo,
                         )
                     else:
                         b_phase = load_b_sfb(
@@ -1347,15 +1257,8 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
             cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
             tile = cons.get_next_tile(sWork, sfull, sempty)
             while tile.valid != i32(0):
-                fin = i32(1)
                 if cutlass.const_expr(swap):
-                    n_cyc = num_sf_cycles
-                    if cutlass.const_expr(self.split_k):
-                        c_lo, c_hi = split_k.cycle_range(
-                            tile.valid, bidx, num_sf_cycles
-                        )
-                        n_cyc = c_hi - c_lo
-                    acc, acc_g, a_phase, b_phase = mma_swap(
+                    acc, _, a_phase, b_phase = mma_swap(
                         tiledmma,
                         self.mma,
                         self.sf,
@@ -1377,29 +1280,13 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                         a_empty,
                         b_full,
                         b_empty,
-                        n_cyc,
+                        num_sf_cycles,
                         sf_stages,
                         kt_per_pack_c,
                         cfg.ab_stage,
                         a_phase,
                         b_phase,
-                        self.split_k,
                     )
-                    if cutlass.const_expr(self.split_k):
-                        S_t = split_k.splits_of(tile.valid)
-                        if S_t > i32(1):
-                            fin = split_k.reduce_partials(
-                                acc,
-                                acc_g,
-                                gSplit,
-                                gCnt,
-                                bidx,
-                                S_t,
-                                tidx,
-                                cfg.mma_threads,
-                                cfg.epi_bar_id,
-                            )
-                        split_act(acc, acc_g)
                 else:
                     acc, a_phase, b_phase = mma(
                         tiledmma,
@@ -1436,26 +1323,25 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                     if next_tile.valid == i32(0):
                         cute.arch.griddepcontrol_launch_dependents()
                 if cutlass.const_expr(swap):
-                    if fin != i32(0):
-                        moe_epilogue.store_wg_q1_swap(
-                            acc,
-                            thr_r2s,
-                            thr_s2r,
-                            sC,
-                            gD_t,
-                            gSFQ,
-                            tile,
-                            (bm, bn),
-                            cfg.epi.out_dtype,
-                            self.qcfg,
-                            cfg.epi_bar_id,
-                            cfg.mma_threads,
-                            SF_M_ALIGN,
-                            UE8M0_PACK_NUM,
-                            tidx,
-                            swap_threads_m,
-                            swap_n_store,
-                        )
+                    moe_epilogue.store_wg_q1_swap(
+                        acc,
+                        thr_r2s,
+                        thr_s2r,
+                        sC,
+                        gD_t,
+                        gSFQ,
+                        tile,
+                        (bm, bn),
+                        cfg.epi.out_dtype,
+                        self.qcfg,
+                        cfg.epi_bar_id,
+                        cfg.mma_threads,
+                        SF_M_ALIGN,
+                        UE8M0_PACK_NUM,
+                        tidx,
+                        swap_threads_m,
+                        swap_n_store,
+                    )
                 else:
                     if cutlass.const_expr(self.epi_q.quant_at is QuantPoint.BEFORE_R2S):
                         store_wg_q1_before_r2s(
@@ -1521,12 +1407,12 @@ def make_args(a_q, a_scale, b_q, b_scale, out_q, out_sf, m_indptr, epi_cfg, tile
         from_dlpack(out_q, assumed_align=16).mark_layout_dynamic(),
         sf(out_sf),
         from_dlpack(m_indptr).mark_layout_dynamic(),
-        *_split_args(a_q.device),
         _stream(),
     )
 
 
-def _split_args(device):
+def make_split_args(device):
+    """Split-K partials scratch and counters of the fused fc1+fc2 kernel's fc1 units."""
     grid_x = torch.cuda.get_device_properties(device).multi_processor_count
     scratch, counters = split_k.workspace(device, grid_x)
     return (

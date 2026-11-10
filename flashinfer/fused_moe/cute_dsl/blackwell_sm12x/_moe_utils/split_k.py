@@ -1,4 +1,5 @@
-"""Device-side dynamic split-K for the SM12x decode fc1_act_q1 swap-AB tile.
+"""Device-side dynamic split-K for the fc1 units (swap-AB (8,128) tile) of the SM12x fused
+fc1+fc2 kernel (kernel_moe_mxfp8_mxfp4_fc12_fused.py); the standalone fc1_act_q1 does not split.
 
 At decode a rank has only D = 1..4 experts with tokens, so fc1 has T = 18*D (8,128) tiles on
 188 persistent CTAs, and each CTA streams its 655 KB of weights through a 2-stage TMA ring at
