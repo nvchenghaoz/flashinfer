@@ -1101,7 +1101,11 @@ def test_wo_dense_gemms_sfb_k_reuse_is_byte_identical() -> None:
 
 
 def _wo_b_fused_vs_unfused(
-    tokens: int, rank: int, groups: int, hidden: int
+    tokens: int,
+    rank: int,
+    groups: int,
+    hidden: int,
+    row_paired_quant: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from b12x.gemm._shared.wo_mxfp8 import wo_b_dense_gemm_fused_quant_mxfp8
 
@@ -1119,33 +1123,47 @@ def _wo_b_fused_vs_unfused(
 
     tmp_q = quantize_wo_b_input_mxfp8(tmp)
     unfused = wo_b_dense_gemm_mxfp8(tmp_q, wo_b, expected_m=tokens)
-    fused = wo_b_dense_gemm_fused_quant_mxfp8(tmp, wo_b, expected_m=tokens)
+    fused = wo_b_dense_gemm_fused_quant_mxfp8(
+        tmp, wo_b, expected_m=tokens, row_paired_quant=row_paired_quant
+    )
     torch.cuda.synchronize()
     return fused, unfused
 
 
-def test_wo_b_fused_quant_matches_unfused_small_shapes() -> None:
+@pytest.mark.parametrize("row_paired_quant", (None, False, True))
+def test_wo_b_fused_quant_matches_unfused_small_shapes(row_paired_quant) -> None:
     require_b12x()
     torch.manual_seed(31008)
 
     for tokens in (1, 3, 8):
-        fused, unfused = _wo_b_fused_vs_unfused(tokens, rank=128, groups=2, hidden=256)
+        fused, unfused = _wo_b_fused_vs_unfused(
+            tokens, rank=128, groups=2, hidden=256, row_paired_quant=row_paired_quant
+        )
         torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
     # Singleton group takes the contiguous-source path.
-    fused, unfused = _wo_b_fused_vs_unfused(2, rank=256, groups=1, hidden=256)
+    fused, unfused = _wo_b_fused_vs_unfused(
+        2, rank=256, groups=1, hidden=256, row_paired_quant=row_paired_quant
+    )
     torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
 
-def test_wo_b_fused_quant_matches_unfused_split_k_serving_shape() -> None:
+@pytest.mark.parametrize("row_paired_quant", (None, False, True))
+def test_wo_b_fused_quant_matches_unfused_split_k_serving_shape(
+    row_paired_quant,
+) -> None:
     require_b12x()
     torch.manual_seed(31009)
 
-    # DS4-Flash TP2 WO-B: N=4096, K=4096 -> the decode policy picks 2-way
-    # split-K; the fused path must produce byte-identical output through the
-    # FP32-partials reduce.
-    for tokens in (1, 4):
+    # DS4-Flash WO-B per rank: TP2 N=4096, K=4096 (2-way split-K at decode)
+    # and TP4 N=4096, K=2048. The fused path must produce byte-identical
+    # output, including through the FP32-partials reduce.
+    for tokens, groups in ((1, 4), (4, 4), (2, 2), (7, 2)):
         fused, unfused = _wo_b_fused_vs_unfused(
-            tokens, rank=1024, groups=4, hidden=4096
+            tokens,
+            rank=1024,
+            groups=groups,
+            hidden=4096,
+            row_paired_quant=row_paired_quant,
         )
         torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
@@ -1199,6 +1217,44 @@ def test_wo_b_fused_quant_concurrent_graph_replays_are_exact(tokens) -> None:
         torch.cuda.synchronize()
         bad += any(not torch.equal(out, expected) for out in outs)
     assert bad == 0, f"{bad}/60 concurrent graph replays differ from eager (M={tokens})"
+
+
+@pytest.mark.parametrize("m", range(1, 9))
+def test_fused_quant_row_paired_producer_matches_dequantized_reference(m) -> None:
+    """Both fused-quant A producers are bitwise equal and match a dequantized
+    MXFP8 reference on a contiguous [M, K] source (rows past M stay unread)."""
+    from b12x._lib.dense_gemm import dense_gemm_fused_quant_a
+
+    require_b12x()
+    torch.manual_seed(31012 + m)
+    n, k = 512, 1024
+    source = (torch.randn((m, k), device="cuda") / 4).bfloat16()
+    source[:, :32] = 0  # an all-zero quantization block
+    source[0, 64:96] *= 64  # a block with a distinct scale
+    weight = quantize_mxfp8_rows_torch(
+        torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / k**0.5
+    )
+    a_q = quantize_mxfp8_rows_torch(source)
+    expected = (
+        dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).double()
+        @ dequantize_mxfp8_rows_torch(weight.values, weight.scale_rows).double().T
+    )
+    outs = []
+    for row_paired_quant in (False, True, None):
+        out = dense_gemm_fused_quant_a(
+            source,
+            weight.values.reshape(n, k, 1),
+            weight.scale_mma,
+            expected_m=m,
+            row_paired_quant=row_paired_quant,
+        )[..., 0]
+        torch.cuda.synchronize()
+        outs.append(out.clone())
+    for out in outs[1:]:
+        torch.testing.assert_close(out, outs[0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        outs[0].double(), expected, rtol=1e-2, atol=1e-2 * expected.abs().max().item()
+    )
 
 
 def test_wo_a_fused_quant_matches_unfused_small_shapes() -> None:

@@ -1297,6 +1297,26 @@ def st_shared_u64(smem_addr: Int32, value: Uint64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_shared_v2_u32(smem_addr: Int32, v0: Uint32, v1: Uint32, *, loc=None, ip=None):
+    """Store 64 bits (2 x uint32, v0 at the lower address) to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v2.u32 [$0], {$1, $2};",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_shared_v4_u32(
     smem_addr: Int32,
     v0: Uint32,

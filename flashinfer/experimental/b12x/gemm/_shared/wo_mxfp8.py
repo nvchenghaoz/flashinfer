@@ -2848,6 +2848,7 @@ def wo_a_dense_gemm_fused_quant_mxfp8(
     expected_m: int | None = None,
     sfb_k_replicated: bool = False,
     stream: object = None,
+    row_paired_quant: bool | None = None,
 ) -> torch.Tensor:
     """Run WO-A at small M with (optionally inverse-RoPE) activation
     quantization fused into the grouped GEMM's DMA warp.
@@ -2883,6 +2884,7 @@ def wo_a_dense_gemm_fused_quant_mxfp8(
         sfb_k_replicated=sfb_k_replicated,
         mma_tiler_mn=_wo_a_fused_mma_tiler(expected_m, rank),
         stream=stream,
+        row_paired_quant=row_paired_quant,
     )
 
 
@@ -2895,6 +2897,7 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     sfb_k_replicated: bool = False,
     _atomic_output_precleared: bool = False,
     stream: object = None,
+    row_paired_quant: bool | None = None,
 ) -> torch.Tensor:
     """Run WO-B at small M with group-major quantization fused into the GEMM.
 
@@ -2948,6 +2951,7 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         a_inner_span=inner_span,
         _atomic_output_precleared=_atomic_output_precleared,
         stream=stream,
+        row_paired_quant=row_paired_quant,
     )
 
 

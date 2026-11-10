@@ -96,6 +96,7 @@ from b12x._lib.intrinsics import (
     ld_shared_v4_u32,
     mma_m16n8k32_f32_e4m3,
     pow2_ceil_ue8m0,
+    st_shared_v2_u32,
     quantize_block_fp8_mx,
     scatter_add_bf16,
     scatter_add_bf16x2,
@@ -737,6 +738,7 @@ class DenseGemmKernel:
         fused_quant_a_nope_dim: int = 0,
         fused_quant_a_rope_dim: int = 0,
         fused_quant_a_wide: bool = False,
+        fused_quant_a_pipe_passes: int = 0,
         atom_shape_24: bool = False,
         b_tile_major: bool = False,
         quantize_c: bool = False,
@@ -934,6 +936,18 @@ class DenseGemmKernel:
         # 128-wide k tile) instead of one, cutting the DMA-warp quantization
         # latency that serializes deep-K small-N pipelines.
         self.fused_quant_a_wide = fused_quant_a_wide
+        # Row-paired fused_quant_a producer (0 = the default producer):
+        # pipe_passes > 0 quantizes A with 16 lanes per row, 2 rows per pass
+        # (pipe_passes = ceil(M/2) <= 4), issues every pass's global load
+        # before any math and writes 8-byte packed sA stores. Same per-32
+        # block math as quantize_block_fp8_mx, so output is bitwise equal.
+        self.fused_quant_a_pipe_passes = int(fused_quant_a_pipe_passes)
+        if self.fused_quant_a_pipe_passes:
+            assert fused_quant_a and load_path == "tma" and not swap_ab
+            assert 1 <= self.fused_quant_a_pipe_passes <= 4
+            assert not fused_quant_a_inv_rope
+            assert tile_k == 128 and sf_vec_size == 32
+            assert mma_tiler_mn[0] >= 2 * self.fused_quant_a_pipe_passes
         self.b_tile_major = b_tile_major
         self.quantize_c = quantize_c
         self.alpha_is_one = alpha_is_one
@@ -2039,6 +2053,8 @@ class DenseGemmKernel:
         if cutlass.const_expr(self.a_bf16_fused):
             sa_base_addr = shared_ptr_to_u32(storage.sA.data_ptr())
             ssfa_base_addr = shared_ptr_to_u32(storage.sSFA.data_ptr())
+        if cutlass.const_expr(self.fused_quant_a_pipe_passes > 0):
+            fqp_sa_base_addr = shared_ptr_to_u32(storage.sA.data_ptr())
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
@@ -3765,7 +3781,158 @@ class DenseGemmKernel:
                     _fq_sg = 0
                     _fq_si = 0
 
-                for _k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
+                if cutlass.const_expr(self.fused_quant_a_pipe_passes > 0):
+                    # Pipelined fused-quant producer (flag-gated; the pinned
+                    # loop below then runs zero iterations). Lane layout:
+                    # (row_sub = lane // 16, scale_group = lane // 4 % 4,
+                    # lane4 = lane % 4); 4 lanes share one 32-value block
+                    # (16 B per lane, butterfly max), 2 rows per pass. Rows
+                    # past M load a clamped valid row and skip their stores,
+                    # so the warp stays converged at the shuffles.
+                    _fqp_lane = Int32(tidx % self.num_threads_per_warp)
+                    _fqp_rsub = _fqp_lane // Int32(16)
+                    _fqp_kblk = ((_fqp_lane // Int32(4)) % Int32(4)) * Int32(32)
+                    _fqp_elem0 = (_fqp_lane % Int32(4)) * Int32(8)
+                    _fqp_m = Int32(quantA_mkl.shape[0])
+                    _fqp_row0 = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+                    _fqp_k_last = k_tile_start + k_tile_iter_cnt - Int32(1)
+                    for _fqp_k in range(0, k_tile_iter_cnt, 1, unroll=1):
+                        mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                        _fqp_kg = k_tile_start + mainloop_producer_state.count
+                        _fqp_gB = tBgB_nkl[(None, _fqp_kg)]
+                        _fqp_sB = tBsB[(None, mainloop_producer_state.index)]
+                        _fqp_gSFB = tBgSFB_nkl[(None, _fqp_kg)]
+                        _fqp_sSFB = tBsSFB[(None, mainloop_producer_state.index)]
+                        # Issue every pass's 16 B load before any math.
+                        _fqp_words = []
+                        for _fqp_p2 in cutlass.range_constexpr(
+                            self.fused_quant_a_pipe_passes
+                        ):
+                            _fqp_words.append(
+                                ld_global_v4_u32(
+                                    get_ptr_as_int64(
+                                        quantA_mkl,
+                                        self._fqp_src_offset(
+                                            quantA_mkl,
+                                            tile_coord_mnl[2],
+                                            cutlass.min(
+                                                _fqp_row0
+                                                + Int32(_fqp_p2 * 2)
+                                                + _fqp_rsub,
+                                                _fqp_m - Int32(1),
+                                            ),
+                                            _fqp_kg * Int32(self.tile_shape_mnk[2])
+                                            + _fqp_kblk,
+                                        )
+                                        + _fqp_elem0,
+                                    )
+                                )
+                            )
+                        _fqp_stage_addr = fqp_sa_base_addr + (
+                            mainloop_producer_state.index
+                            * Int32(self.tile_shape_mnk[0] * self.tile_shape_mnk[2])
+                        )
+                        for _fqp_p in cutlass.range_constexpr(
+                            self.fused_quant_a_pipe_passes
+                        ):
+                            _fqp_w = _fqp_words[_fqp_p]
+                            _fqp_v0, _fqp_v1 = bfloat2_to_float2_scaled(
+                                _fqp_w[0], cutlass.Float32(1.0)
+                            )
+                            _fqp_v2, _fqp_v3 = bfloat2_to_float2_scaled(
+                                _fqp_w[1], cutlass.Float32(1.0)
+                            )
+                            _fqp_v4, _fqp_v5 = bfloat2_to_float2_scaled(
+                                _fqp_w[2], cutlass.Float32(1.0)
+                            )
+                            _fqp_v6, _fqp_v7 = bfloat2_to_float2_scaled(
+                                _fqp_w[3], cutlass.Float32(1.0)
+                            )
+                            _fqp_max = cutlass.Float32(0.0)
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v0))
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v1))
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v2))
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v3))
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v4))
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v5))
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v6))
+                            _fqp_max = fmax_f32(_fqp_max, fabs_f32(_fqp_v7))
+                            for _fqp_sh in cutlass.range_constexpr(2):
+                                _fqp_max = fmax_f32(
+                                    _fqp_max,
+                                    cute.arch.shuffle_sync_bfly(
+                                        _fqp_max, offset=1 << _fqp_sh
+                                    ),
+                                )
+                            _fqp_unused, _fqp_sbyte = pow2_ceil_ue8m0(
+                                _fqp_max * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
+                            )
+                            if _fqp_max == cutlass.Float32(0.0):
+                                _fqp_sbyte = cutlass.Uint32(127)
+                            _fqp_inv = ue8m0_to_output_scale(_fqp_sbyte)
+                            _fqp_pay0 = cvt_f32x4_to_e4m3x4(
+                                _fqp_v0 * _fqp_inv,
+                                _fqp_v1 * _fqp_inv,
+                                _fqp_v2 * _fqp_inv,
+                                _fqp_v3 * _fqp_inv,
+                            )
+                            _fqp_pay1 = cvt_f32x4_to_e4m3x4(
+                                _fqp_v4 * _fqp_inv,
+                                _fqp_v5 * _fqp_inv,
+                                _fqp_v6 * _fqp_inv,
+                                _fqp_v7 * _fqp_inv,
+                            )
+                            _fqp_row_local = Int32(_fqp_p * 2) + _fqp_rsub
+                            if _fqp_row0 + _fqp_row_local < _fqp_m:
+                                # SW128 K-major E4M3 atom: 128 B rows, 16 B
+                                # chunks XORed by (row % 8); 8 B aligned runs
+                                # stay contiguous.
+                                st_shared_v2_u32(
+                                    _fqp_stage_addr
+                                    + _fqp_row_local * Int32(self.tile_shape_mnk[2])
+                                    + (
+                                        (_fqp_kblk + _fqp_elem0)
+                                        ^ ((_fqp_row_local % Int32(8)) * Int32(16))
+                                    ),
+                                    _fqp_pay0,
+                                    _fqp_pay1,
+                                )
+                                if _fqp_elem0 == Int32(0):
+                                    sSFA[
+                                        (
+                                            _fqp_row_local,
+                                            _fqp_kblk,
+                                            mainloop_producer_state.index,
+                                        )
+                                    ] = cutlass.Uint8(_fqp_sbyte).bitcast(
+                                        cutlass.Float8E8M0FNU
+                                    )
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self._fqp_copy_b(
+                            tma_atom_b,
+                            _fqp_gB,
+                            _fqp_sB,
+                            mainloop_pipeline.producer_get_barrier(
+                                mainloop_producer_state
+                            ),
+                        )
+                        # SFB is the post-fence doorbell: the full barrier's
+                        # tx_count (B + SFB) cannot complete before it lands.
+                        cute.copy(
+                            tma_atom_sfb,
+                            _fqp_gSFB,
+                            _fqp_sSFB,
+                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                mainloop_producer_state
+                            ),
+                        )
+                        mainloop_pipeline.producer_commit(mainloop_producer_state)
+                        mainloop_producer_state.advance()
+                    _fqp_main_iters = Int32(0)
+                else:
+                    _fqp_main_iters = k_tile_iter_cnt
+
+                for _k_tile in range(0, _fqp_main_iters, 1, unroll=2):
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
 
                     k_tile_global = k_tile_start + mainloop_producer_state.count
@@ -4845,6 +5012,38 @@ class DenseGemmKernel:
 
             mainloop_pipeline.producer_tail(mainloop_producer_state)
         return
+
+    def _fqp_src_offset(self, quantA_mkl, l_coord, row, k_elem0):
+        """Element offset of fused-quant A[row, k_elem0] (k_elem0 at a 32-block
+        start), with the same addressing as the pinned fused_quant_a branch."""
+        if self.fused_quant_a_inner_span > 0:
+            span = Int32(self.fused_quant_a_inner_span)
+            outer = k_elem0 // span
+            return (
+                outer * (Int32(quantA_mkl.shape[0]) * span)
+                + row * span
+                + (k_elem0 - outer * span)
+            )
+        if self.fused_quant_a_row_stride > 0:
+            offset = row * Int32(self.fused_quant_a_row_stride) + k_elem0
+        else:
+            offset = row * Int32(quantA_mkl.shape[1]) + k_elem0
+        if self.fused_quant_a_l_stride > 0:
+            offset = offset + l_coord * Int32(self.fused_quant_a_l_stride)
+        return offset
+
+    def _fqp_copy_b(self, tma_atom_b, gB, sB, bar_ptr):
+        """B's TMA with the pinned path's cache policy choice."""
+        if self.b_tile_major or self.occupancy > 1:
+            cute.copy(
+                tma_atom_b,
+                gB,
+                sB,
+                tma_bar_ptr=bar_ptr,
+                cache_policy=Int64(0x12F0000000000000),
+            )
+        else:
+            cute.copy(tma_atom_b, gB, sB, tma_bar_ptr=bar_ptr)
 
     @staticmethod
     def _compute_stages(
@@ -6016,20 +6215,29 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
         *args,
         fused_quant_a_inner_span: int = 0,
         fused_quant_a_wide: bool = False,
+        fused_quant_a_pipe_passes: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._fused_quant_a_inner_span = int(fused_quant_a_inner_span)
         self._fused_quant_a_wide = bool(fused_quant_a_wide)
+        self._fused_quant_a_pipe_passes = int(fused_quant_a_pipe_passes)
 
     def compile_key(self) -> tuple[object, ...]:
         # Keep the fused entry point separate even if every ordinary launch
         # specialization matches. Deriving the rest from the parent key avoids
         # silently omitting a future codegen field here.
+        # The default producer keeps its pre-existing key.
+        pipe_key = (
+            (("pipe_passes", self._fused_quant_a_pipe_passes),)
+            if self._fused_quant_a_pipe_passes
+            else ()
+        )
         return (
             "fused_quant_a",
             self._fused_quant_a_inner_span,
             self._fused_quant_a_wide,
+            *pipe_key,
             *super().compile_key(),
         )
 
@@ -6103,6 +6311,7 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             fused_quant_a=True,
             fused_quant_a_inner_span=self._fused_quant_a_inner_span,
             fused_quant_a_wide=self._fused_quant_a_wide,
+            fused_quant_a_pipe_passes=self._fused_quant_a_pipe_passes,
             atom_shape_24=self._atom_shape_24,
             b_tile_major=self._b_tile_major,
             target_occupancy=self._target_occupancy,
@@ -6137,6 +6346,7 @@ def _get_compiled_dense_gemm_fused_quant_a(
     a_inner_span: int = 0,
     kernel_c_l: int = 1,
     a_wide: bool = False,
+    pipe_passes: int = 0,
 ) -> Callable:
     launch = _DenseGemmFusedQuantALaunch(
         n=n,
@@ -6164,6 +6374,7 @@ def _get_compiled_dense_gemm_fused_quant_a(
         b_tile_major=b_tile_major,
         fused_quant_a_inner_span=a_inner_span,
         fused_quant_a_wide=a_wide,
+        fused_quant_a_pipe_passes=pipe_passes,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -6280,9 +6491,11 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
         fused_quant_a_wide: bool,
         positions_dtype: Type[cutlass.Numeric],
         cos_sin_dtype: Type[cutlass.Numeric],
+        fused_quant_a_pipe_passes: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self._fused_quant_a_pipe_passes = int(fused_quant_a_pipe_passes)
         self._fused_quant_a_row_stride = int(fused_quant_a_row_stride)
         self._fused_quant_a_l_stride = int(fused_quant_a_l_stride)
         self._fused_quant_a_inv_rope = bool(fused_quant_a_inv_rope)
@@ -6294,6 +6507,11 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
         self._cos_sin_dtype = cos_sin_dtype
 
     def compile_key(self) -> tuple[object, ...]:
+        pipeline_key = (
+            (("pipe_passes", self._fused_quant_a_pipe_passes),)
+            if self._fused_quant_a_pipe_passes
+            else ()
+        )
         return (
             "fused_quant_a_grouped",
             self._fused_quant_a_row_stride,
@@ -6305,6 +6523,7 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             self._fused_quant_a_wide,
             self._positions_dtype,
             self._cos_sin_dtype,
+            *pipeline_key,
             *super().compile_key(),
         )
 
@@ -6382,6 +6601,7 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             fused_quant_a_nope_dim=self._fused_quant_a_nope_dim,
             fused_quant_a_rope_dim=self._fused_quant_a_rope_dim,
             fused_quant_a_wide=self._fused_quant_a_wide,
+            fused_quant_a_pipe_passes=self._fused_quant_a_pipe_passes,
             atom_shape_24=self._atom_shape_24,
             target_occupancy=self._target_occupancy,
         )(
@@ -6400,6 +6620,29 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             self._max_active_clusters,
             current_stream,
         )
+
+
+# M at which the row-paired fused-quant producer is the default. RTX PRO 6000
+# (SM120), N,K in {4096..6144} x {2048..14336}: it is 2-5% faster at M=1 and
+# 16-24% faster at M=2, within -2%..+6% at M=3-4 and 10-25% slower at M>=5
+# (more passes serialize on the single DMA warp).
+_FUSED_QUANT_ROW_PAIRED_DEFAULT_M = frozenset((1, 2))
+
+
+def _fused_quant_a_pipe_passes(
+    row_paired: Optional[bool], m: int, inv_rope: bool = False
+) -> int:
+    """Kernel pipe_passes for the fused-quant A producer (0 = default producer).
+
+    ``row_paired`` None selects the measured default for ``m``; True/False
+    force it where the row-paired producer applies (1 <= M <= 8, no inverse
+    RoPE) and are ignored elsewhere.
+    """
+    if inv_rope or not 1 <= m <= 8:
+        return 0
+    if row_paired is None:
+        row_paired = m in _FUSED_QUANT_ROW_PAIRED_DEFAULT_M
+    return (m + 1) // 2 if row_paired else 0
 
 
 def _cutlass_positions_dtype(dtype: torch.dtype) -> Type[cutlass.Numeric]:
@@ -6436,6 +6679,7 @@ def _get_compiled_dense_gemm_fused_quant_a_grouped(
     a_wide: bool,
     positions_dtype: Type[cutlass.Numeric],
     cos_sin_dtype: Type[cutlass.Numeric],
+    pipe_passes: int = 0,
 ) -> Callable:
     launch = _DenseGemmFusedQuantAGroupedLaunch(
         n=n,
@@ -6469,6 +6713,7 @@ def _get_compiled_dense_gemm_fused_quant_a_grouped(
         fused_quant_a_wide=a_wide,
         positions_dtype=positions_dtype,
         cos_sin_dtype=cos_sin_dtype,
+        fused_quant_a_pipe_passes=pipe_passes,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -6614,6 +6859,7 @@ def dense_gemm_fused_quant_a_grouped(
     sfb_k_replicated: bool = False,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     stream: object = None,
+    row_paired_quant: Optional[bool] = None,
 ) -> torch.Tensor:
     """Small-M grouped BF16-A -> MXFP8 GEMM quantizing A in each CTA (WO-A).
 
@@ -6731,6 +6977,7 @@ def dense_gemm_fused_quant_a_grouped(
         (expected_m if expected_m is not None else m) == 1,
         positions_dtype,
         cos_sin_dtype,
+        _fused_quant_a_pipe_passes(row_paired_quant, m, bool(inv_rope)),
     )
     return compiled(
         source,
@@ -7970,6 +8217,7 @@ def dense_gemm_fused_quant_a(
     _atomic_output_precleared: bool = False,
     _split_k_workspace: Optional[torch.Tensor] = None,
     stream: object = None,
+    row_paired_quant: Optional[bool] = None,
 ) -> torch.Tensor:
     """Small-M BF16-A -> MXFP8 GEMM with activation quantization in each CTA.
 
@@ -7978,6 +8226,11 @@ def dense_gemm_fused_quant_a(
     `[K/span, M, span]` storage (the WO tmp group-major layout). Follows the
     dense_gemm split-K policy (FP32 partials + fused reduce) instead of forcing
     a single un-split kernel, which loses ~2x at M=1 for N,K >= 4096.
+
+    row_paired_quant selects the A-quantization producer: True quantizes with
+    16 lanes per row and 2 rows per pass (all A loads issued before the math),
+    False keeps the one-row-per-pass producer, None picks the measured default
+    for M. Both are bitwise equal.
     """
 
     a_inner_span = int(a_inner_span)
@@ -8102,6 +8355,7 @@ def dense_gemm_fused_quant_a(
         a_inner_span,
         kernel_c_l,
         (expected_m if expected_m is not None else m) == 1,
+        _fused_quant_a_pipe_passes(row_paired_quant, m),
     )
     compiled(
         source,
