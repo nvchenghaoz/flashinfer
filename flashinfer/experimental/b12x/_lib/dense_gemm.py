@@ -2692,6 +2692,9 @@ class DenseGemmKernel:
                                 packed_b_lookahead_state.advance()
 
                         if k_block_idx == num_k_blocks - 1:
+                            # Order the MMA warps' generic-proxy smem reads of this stage
+                            # before the producer's next TMA (async-proxy) write into it.
+                            cute.arch.fence_proxy("async.shared", space="cta")
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
                             mainloop_consumer_state.advance()
 
@@ -2905,6 +2908,7 @@ class DenseGemmKernel:
                     )
 
                     if k_block_idx == num_k_blocks - 1:
+                        cute.arch.fence_proxy("async.shared", space="cta")
                         mainloop_pipeline.consumer_release(mainloop_consumer_state)
                         mainloop_consumer_state.advance()
 

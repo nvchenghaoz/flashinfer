@@ -1150,6 +1150,57 @@ def test_wo_b_fused_quant_matches_unfused_split_k_serving_shape() -> None:
         torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("tokens", (1, 4))
+def test_wo_b_fused_quant_concurrent_graph_replays_are_exact(tokens) -> None:
+    """The MMA warps must fence the async proxy before releasing a mainloop
+    smem stage; without it the next TMA write races their generic-proxy reads
+    when another stream's DRAM traffic overlaps the GEMM."""
+    from b12x.gemm._shared.wo_mxfp8 import wo_b_dense_gemm_fused_quant_mxfp8
+
+    require_b12x()
+    torch.manual_seed(31013)
+    rank, groups, hidden = 1024, 2, 4096  # DeepSeek-V4.1-Flash WO-B per TP4 rank
+    tmp = empty_dense_gemm_mnl_view(
+        tokens, rank, groups, device="cuda", dtype=torch.bfloat16
+    )
+    tmp.copy_(torch.randn((tokens, rank, groups), device="cuda") / 4)
+    wo_b = quantize_mxfp8_rows_torch(
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
+        / (groups * rank) ** 0.5
+    )
+    outs = [
+        torch.empty((tokens, hidden, 1), device="cuda", dtype=torch.bfloat16)
+        for _ in range(8)
+    ]
+
+    def launch(out):
+        wo_b_dense_gemm_fused_quant_mxfp8(tmp, wo_b, out=out, expected_m=tokens)
+
+    launch(outs[0])
+    torch.cuda.synchronize()
+    expected = outs[0].clone()
+    noise = torch.ones(64 * 2**20, device="cuda")  # 256 MB
+    side = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        main = torch.cuda.current_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            for _ in range(4):
+                noise.mul_(1.0)
+        for out in outs:
+            launch(out)
+        main.wait_stream(side)
+    bad = 0
+    for _ in range(60):
+        for out in outs:
+            out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        bad += any(not torch.equal(out, expected) for out in outs)
+    assert bad == 0, f"{bad}/60 concurrent graph replays differ from eager (M={tokens})"
+
+
 def test_wo_a_fused_quant_matches_unfused_small_shapes() -> None:
     require_b12x()
     torch.manual_seed(31010)

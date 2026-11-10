@@ -139,3 +139,56 @@ def test_mm_mxfp8_sm120_rejects_linear_scales():
         mm_mxfp8(
             a_fp8, b_fp8.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="cutlass"
         )
+
+
+def _concurrent_replay_mismatches(launch, outs, replays=60):
+    """Replay `launch(out)` for every out in a CUDA graph beside a memory-bound
+    branch on a second stream; count replays whose output differs bitwise from
+    the eager result. Outputs are NaN-poisoned before every replay."""
+    launch(outs[0])
+    torch.cuda.synchronize()
+    expected = outs[0].clone()
+    noise = torch.ones(64 * 2**20, device="cuda")  # 256 MB
+    side = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        main = torch.cuda.current_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            for _ in range(4):
+                noise.mul_(1.0)
+        for out in outs:
+            launch(out)
+        main.wait_stream(side)
+    bad = 0
+    for _ in range(replays):
+        for out in outs:
+            out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        bad += any(not torch.equal(out, expected) for out in outs)
+    return bad
+
+
+@pytest.mark.parametrize("m", [1, 4])
+def test_mm_mxfp8_b12x_concurrent_graph_replays_are_exact(m):
+    """A released mainloop smem stage must not be overwritten by the next TMA
+    while the MMA warps' generic-proxy reads are still in flight (needs
+    fence.proxy.async before consumer_release). The race shows up when another
+    stream's DRAM traffic overlaps the GEMM."""
+    _skip_if_not_sm120()
+    from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
+
+    if not _b12x_mxfp8_dsl_supported():
+        pytest.skip("b12x mm_mxfp8 requires nvidia-cutlass-dsl >= 4.6.0")
+    n, k = 4096, 2048  # DeepSeek-V4.1-Flash attention O-projection per TP4 rank
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_fp8, b_fp8, a_sf, b_sf = _prepare_mxfp8(a, b, swizzled=True)
+    outs = [torch.empty([m, n], device="cuda", dtype=torch.bfloat16) for _ in range(8)]
+
+    def launch(out):
+        mm_mxfp8(a_fp8, b_fp8.T, a_sf, b_sf, out=out, backend="b12x")
+
+    bad = _concurrent_replay_mismatches(launch, outs)
+    assert bad == 0, f"{bad}/60 concurrent graph replays differ from eager (M={m})"
