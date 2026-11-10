@@ -624,12 +624,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         sc1 = (offs1["sC"], offs1["sC"] + dict(regions1)["sC"])
         rng2 = {k: (offs2[k], offs2[k] + v) for k, v in sz2.items()}
         overlap = any(lo < sc1[1] and sc1[0] < hi for lo, hi in rng2.values())
-        print(
-            f"[fc12_fused] smem pool: sC1=[{sc1[0]},{sc1[1]}) sB2=[{rng2['sB'][0]},"
-            f"{rng2['sB'][1]}) sSFB2=[{rng2['sSFB'][0]},{rng2['sSFB'][1]}) "
-            f"overlap={overlap}",
-            flush=True,
-        )
         assert not overlap, "EARLY_W2 needs sB/sSFB (fc2) disjoint from sC (fc1)"
         assert c1.owns_epi_smem, "EARLY_W2 needs the fc1 epilogue's own sC region"
         pool_bytes = _align(max(end1, end2), 1024)
@@ -1360,6 +1354,51 @@ def _stream():
 
 _COMPILED: dict = {}
 
+#: Token counts at or below which the runner picks the fused kernel when not told
+#: otherwise. Measured on RTX PRO 6000 (benchmarks/bench_sm12x_mxfp8_mxfp4_fused_fc12.py):
+#: at 1..64 tokens the fused kernel is 1-23% faster than the chain on three shapes under
+#: uniform and skewed routing (within 1% at skewed 32). At 128 it is ~1-5% faster in
+#: five of six cases but ~2.5% slower under skewed DeepSeek-V4.1-Flash routing, where
+#: one hot expert's long m-block chain serializes FC2 behind it, so 128 keeps the chain.
+AUTO_MAX_TOKENS = 64
+
+
+def fc12_fused_supported(
+    *, total_rows: int, hidden: int, intermediate: int, num_experts: int
+) -> bool:
+    """Whether the fused kernel can run this call.
+
+    It reuses the chain's decode tiles (fc1 swap-AB 8x128, fc2 32x128), which the
+    chain selects while the routed rows average <= 32 per expert; the per-column
+    counters cover at most KCOLS_MAX fc1 column tiles and MAX_GROUPS experts.
+    Uneven routing is fine: an expert with more rows simply has more m-blocks.
+    """
+    return (
+        num_experts > 0
+        and total_rows // num_experts <= 32
+        and num_experts <= MAX_GROUPS
+        and hidden % 128 == 0
+        and intermediate % 128 == 0
+        and ceil_div(intermediate, 128) <= KCOLS_MAX
+    )
+
+
+def fc12_fused_preferred(
+    *,
+    num_tokens: int,
+    total_rows: int,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+) -> bool:
+    """Default dispatch: fused where supported and measured not slower than the chain."""
+    return num_tokens <= AUTO_MAX_TOKENS and fc12_fused_supported(
+        total_rows=total_rows,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+    )
+
 
 def cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4(
     a_q,
@@ -1379,7 +1418,7 @@ def cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4(
     swiglu_limit=None,
     enable_pdl: bool = False,
 ):
-    """fc1_act_q1 + fc2_finalize in one launch (decode shapes: <= 32 rows per expert).
+    """fc1_act_q1 + fc2_finalize in one launch (shapes where fc12_fused_supported holds).
 
     Same contract as calling cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(a_q, a_scale, w1, w1_scale,
     m_indptr, out_q=out_q, out_sf=out_sf, activation=Swiglu, swiglu_limit=...) and then

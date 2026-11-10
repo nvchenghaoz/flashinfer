@@ -24,6 +24,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 from __future__ import annotations
 
 import functools
+import math
 import warnings
 import weakref
 from collections import OrderedDict
@@ -63,6 +64,7 @@ from ..quantization.nvfp4_quantization_utils import (
 from ..tllm_enums import DEFAULT_SWIGLU_LIMIT
 from ..utils import get_compute_capability, next_positive_power_of_2, round_up
 from .api import (
+    SM12xMxfp8Mxfp4Config,
     _CUDNN_GROUPED_GEMM_BF16_ARCHS,
     _CUDNN_GROUPED_GEMM_FP4_ARCHS,
     _CUDNN_GROUPED_GEMM_FP8_ARCHS,
@@ -8592,8 +8594,17 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             mxfp8_q0_route_triton,
         )
 
+        from .cute_dsl.blackwell_sm12x.kernel_moe_mxfp8_mxfp4_fc12_fused import (
+            cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4,
+            fc12_fused_preferred,
+            fc12_fused_supported,
+        )
+
         self._fc1 = cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4
         self._fc2 = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+        self._fc12 = cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4
+        self._fc12_supported = fc12_fused_supported
+        self._fc12_preferred = fc12_fused_preferred
         self._out_sf_shape = out_sf_shape
         self._workspace_cls = Mxfp8Q0RouteWorkspace
         self._make_workspace = make_mxfp8_q0_route_workspace
@@ -8602,6 +8613,34 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
         return [-1]
+
+    def _use_fc12(
+        self,
+        num_tokens: int,
+        total_rows: int,
+        w1: torch.Tensor,
+        act_kwargs: dict[str, Any],
+    ) -> bool:
+        """Fused FC1+FC2 kernel (SwiGLU only) per the backend's ``fused_fc12``."""
+        choice = next(
+            (
+                backend.fused_fc12
+                for backend in self.config.backend
+                if isinstance(backend, SM12xMxfp8Mxfp4Config)
+            ),
+            None,
+        )
+        if choice is False or act_kwargs["activation"] is not ActivationType.Swiglu:
+            return False
+        shape = dict(
+            total_rows=total_rows,
+            hidden=w1.shape[2] * 2,
+            intermediate=w1.shape[1] // 2,
+            num_experts=w1.shape[0],
+        )
+        if choice:
+            return self._fc12_supported(**shape)
+        return self._fc12_preferred(num_tokens=num_tokens, **shape)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -8634,20 +8673,22 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
         workspace = self._make_workspace(x, act.topk_ids, num_experts)
         total_pairs = x.shape[0] * act.topk_ids.shape[1]
         intermediate_size = view["w1_weight"].shape[1] // 2
-        q1 = torch.empty(
-            total_pairs,
-            intermediate_size,
-            dtype=torch.float8_e4m3fn,
-            device=x.device,
+        # q1, sf1 and the output share one buffer that the route zero-fills
+        # in its own kernel on every call: FC2 accumulates into the output,
+        # and its 32-row tiles read q1/sf1 rows past the routed ones (left
+        # unwritten by FC1 when pairs are unrouted), whose stale bytes can
+        # be NaN. The output goes last, so the buffer ends 8-byte aligned.
+        sf1_shape = self._out_sf_shape(total_pairs, intermediate_size, num_experts)
+        q1_bytes = total_pairs * intermediate_size
+        sf1_off = round_up(q1_bytes, 128)
+        out_off = round_up(sf1_off + 4 * math.prod(sf1_shape), 128)
+        buf = torch.empty(
+            out_off + 2 * x.shape[0] * x.shape[1], dtype=torch.uint8, device=x.device
         )
-        sf1 = torch.zeros(
-            self._out_sf_shape(total_pairs, intermediate_size, num_experts),
-            dtype=torch.int32,
-            device=x.device,
-        )
-        output = torch.zeros(
-            x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
-        )
+        q1 = buf[:q1_bytes].view(torch.float8_e4m3fn).view(-1, intermediate_size)
+        sf1 = buf[sf1_off:out_off].view(torch.int32)[: math.prod(sf1_shape)]
+        sf1 = sf1.view(sf1_shape)
+        output = buf[out_off:].view(torch.bfloat16).view(x.shape[0], x.shape[1])
         return [
             x,
             act.topk_ids,
@@ -8659,6 +8700,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             q1,
             sf1,
             output,
+            buf,
             workspace.counts,
             workspace.offsets,
             workspace.expert_cursor,
@@ -8680,12 +8722,11 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
         self._require_built()
         if tactic != -1:
             raise ValueError("SM12x MXFP8 x MXFP4 supports only tactic -1.")
-        x, ids, topk_weights, w1, w1_sf, w2, w2_sf, q1, sf1, output = inputs[:10]
-        workspace = self._workspace_cls(*inputs[10:])
+        x, ids, topk_weights, w1, w1_sf, w2, w2_sf, q1, sf1, output, buf = inputs[:11]
+        workspace = self._workspace_cls(*inputs[11:])
         activation = self.config.activation
         act_kwargs = _sm12x_mxfp8_mxfp4_activation_kwargs(activation)
         enable_pdl = self.config.execution.enable_pdl is not False
-        output.zero_()
         offsets, token_map, route_weights, a_q, a_scale = self._route(
             x,
             ids,
@@ -8693,7 +8734,27 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             self.config.routing.num_experts,
             workspace=workspace,
             enable_pdl=enable_pdl,
+            zero_buf=buf,
         )
+        if self._use_fc12(x.shape[0], a_q.shape[0], w1, act_kwargs):
+            self._fc12(
+                a_q,
+                a_scale,
+                w1,
+                w1_sf,
+                offsets,
+                w2,
+                w2_sf,
+                token_map,
+                route_weights,
+                x.shape[0],
+                out_q=q1,
+                out_sf=sf1,
+                out=output,
+                swiglu_limit=act_kwargs["swiglu_limit"],
+                enable_pdl=enable_pdl,
+            )
+            return output
         self._fc1(
             a_q,
             a_scale,

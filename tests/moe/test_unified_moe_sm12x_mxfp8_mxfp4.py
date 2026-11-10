@@ -21,6 +21,7 @@ from flashinfer.fused_moe import (
     SiTU,
     SwiGLU,
 )
+from flashinfer.fused_moe.runners import _sm12x_mxfp8_mxfp4_activation_kwargs
 from flashinfer.utils import is_sm120a_supported
 from tests.moe.test_cute_dsl_sm12x_mxfp8_mxfp4 import (
     calc_diff,
@@ -236,3 +237,90 @@ def test_sm12x_mxfp8_mxfp4_unified_runner_skips_unrouted(tokens, pattern):
     if routed.any():
         ref = _reference(x, masked_ids, route_weights, w1q, w1sf, w2q, w2sf, activation)
         assert calc_diff(got[routed], ref[routed]) < 2e-2
+
+
+def _fc12_routing(tokens, experts, top_k, pattern, generator):
+    """Distinct experts per token; ``skewed`` sends every token to expert 0 (so
+    one expert gets all ``tokens`` rows, beyond the 32-row decode tile), and
+    ``sparse`` draws from only 3 experts, leaving the rest empty."""
+    pool = {"uniform": experts, "skewed": experts, "sparse": 3}[pattern]
+    k = min(top_k, pool)
+    scores = torch.rand(tokens, pool, generator=generator, device="cuda")
+    if pattern == "skewed":
+        scores[:, 0] = 2.0
+    ids = scores.topk(k, dim=1).indices.to(torch.int32)
+    if k < top_k:
+        pad = torch.full((tokens, top_k - k), -1, dtype=torch.int32, device="cuda")
+        ids = torch.cat([ids, pad], dim=1)
+    return ids
+
+
+@pytest.mark.parametrize("pattern", ["uniform", "skewed", "sparse"])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16, 32, 64, 128])
+def test_sm12x_mxfp8_mxfp4_fused_fc12_matches_chain(tokens, pattern):
+    """The fused FC1+FC2 kernel against the two-kernel chain and the reference,
+    including one expert with more rows than a decode tile and empty experts."""
+    if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("requires an SM120a device")
+    torch.manual_seed(5)
+    gen = torch.Generator(device="cuda").manual_seed(tokens)
+    # intermediate 640: five FC1 column tiles, so FC2's per-column acquire spans
+    # several release counters and a partial SF pack.
+    experts, top_k, hidden, intermediate = 16, 4, 512, 640
+    activation = SwiGLU(limit=7.0)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 10
+    w1 = torch.randn(
+        experts, 2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16
+    ) / math.sqrt(hidden)
+    w2 = torch.randn(
+        experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16
+    ) / math.sqrt(intermediate)
+    ids = _fc12_routing(tokens, experts, top_k, pattern, gen)
+    route_weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=1)
+    w1q, w1sf_packed, w1sf = _quantize_weights(w1)
+    w2q, w2sf_packed, w2sf = _quantize_weights(w2)
+    act_pack = MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        topk_ids=ids,
+        topk_weights=route_weights,
+    )
+    outs = {}
+    for fused in (False, True):
+        backend = SM12xMxfp8Mxfp4Config(fused_fc12=fused)
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(
+            "sm12x_mxfp8_mxfp4",
+            backend.prepare_weights(w1q, w1sf_packed, w2q, w2sf_packed),
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=experts, top_k=top_k),
+            quant=QuantConfig(
+                weight=QuantFormat.MXFP4,
+                activation=QuantFormat.MXFP8,
+                per_token_scale=False,
+            ),
+            experts=ExpertConfig(
+                intermediate_size=intermediate, local_num_experts=experts
+            ),
+            activation=activation,
+            backend=BackendOptions(candidates=(backend,)),
+            execution=ExecutionConfig(enable_pdl=False),
+        )
+        layer = MoELayer(config, device=x.device)
+        runner = layer.runners[0]
+        act_kwargs = _sm12x_mxfp8_mxfp4_activation_kwargs(activation)
+        assert runner._use_fc12(tokens, tokens * top_k, w1q, act_kwargs) is fused
+        outs[fused] = layer(act_pack, weight_pack).float()
+        # Replay: the kernel resets its own sync counters on exit.
+        outs[fused, "again"] = layer(act_pack, weight_pack).float()
+    torch.cuda.synchronize()
+    chain, fused = outs[False], outs[True]
+    assert torch.isfinite(fused).all()
+    # Same q1/sf1 bits as the chain; FC2's scatter-add order may differ.
+    torch.testing.assert_close(fused, chain, rtol=2e-2, atol=1e-3)
+    torch.testing.assert_close(outs[True, "again"], fused, rtol=2e-2, atol=1e-3)
+    unrouted = (ids < 0).all(dim=1)
+    assert torch.equal(fused[unrouted], torch.zeros_like(fused[unrouted]))
+    ref = _reference(x, ids, route_weights, w1q, w1sf, w2q, w2sf, activation)
+    assert calc_diff(fused, ref) < 2e-2

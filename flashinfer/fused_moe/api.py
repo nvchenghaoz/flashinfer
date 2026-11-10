@@ -2677,7 +2677,22 @@ class SM12xFp8Config:
 
 @dataclass(frozen=True)
 class SM12xMxfp8Mxfp4Config:
-    """SM120/SM121 CuTe-DSL MXFP8 x MXFP4 backend."""
+    """SM120/SM121 CuTe-DSL MXFP8 x MXFP4 backend.
+
+    Parameters
+    ----------
+    fused_fc12 : bool or None
+        Run FC1 (+ SwiGLU + MXFP8 requantization) and FC2 as one persistent
+        kernel instead of the two-kernel ``fc1_act_q1`` -> ``fc2_finalize``
+        chain. ``None`` (default) picks per call with a measured rule (small
+        token counts, where the second launch and FC2's serialized weight
+        stream dominate); ``True`` forces it wherever the shape is supported
+        (otherwise the chain runs); ``False`` always runs the chain. Results
+        match the chain up to the order of FC2's scatter-add atomics.
+    """
+
+    _: KW_ONLY
+    fused_fc12: Optional[bool] = None
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -2694,7 +2709,9 @@ class SM12xMxfp8Mxfp4Config:
         }
 
     def __repr__(self) -> str:
-        return "SM12xMxfp8Mxfp4Config()"
+        if self.fused_fc12 is None:
+            return "SM12xMxfp8Mxfp4Config()"
+        return f"SM12xMxfp8Mxfp4Config(fused_fc12={self.fused_fc12})"
 
 
 @dataclass(frozen=True)
